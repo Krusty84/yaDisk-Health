@@ -97,6 +97,9 @@ class CheckSelection:
     mode: str
     files: list[DiskFile]
     total_candidates: int
+    full_run_id: int | None = None
+    completed_count: int = 0
+    probe_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,8 @@ class CheckRun:
     failed_count: int
     unknown_count: int
     status: str | None
+    probe_bytes: int | None = None
+    resume_of: int | None = None
 
     @property
     def duration(self) -> float:
@@ -175,6 +180,19 @@ class HistoryStore:
                 ON checks(path, id) WHERE {CONFIRMED_CHECK_SQL}""")
             if version < 1:
                 self.connection.execute("PRAGMA user_version = 1")
+            if version < 2:
+                columns = {row[1] for row in self.connection.execute("PRAGMA table_info(check_runs)")}
+                for name, kind in (("probe_bytes", "INTEGER"), ("resume_of", "INTEGER REFERENCES check_runs(id)")):
+                    if name not in columns:
+                        self.connection.execute(f"ALTER TABLE check_runs ADD COLUMN {name} {kind}")
+                self.connection.execute("""CREATE TABLE IF NOT EXISTS full_run_files (
+                    run_id INTEGER NOT NULL REFERENCES check_runs(id), path TEXT NOT NULL,
+                    name TEXT NOT NULL, size INTEGER, completed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (run_id, path)
+                )""")
+                self.connection.execute("""CREATE INDEX IF NOT EXISTS full_run_pending
+                    ON full_run_files(run_id, completed, path)""")
+                self.connection.execute("PRAGMA user_version = 2")
 
     def __enter__(self):
         return self
@@ -225,11 +243,36 @@ class HistoryStore:
             files = random.Random(seed).sample(files, count)
         return CheckSelection(mode, files, candidates)
 
-    def start_run(self, mode: str, candidates: int, selected: int) -> int:
+    def full_selection(self) -> CheckSelection | None:
+        row = self.connection.execute("""SELECT id, selected_count, probe_bytes FROM check_runs
+            WHERE mode = 'full' AND resume_of IS NULL ORDER BY id DESC LIMIT 1""").fetchone()
+        if row is None or row[2] is None:
+            return None
+        run_id, total, probe_bytes = row
+        files = [DiskFile(name, path, size) for path, name, size in self.connection.execute(
+            "SELECT path, name, size FROM full_run_files WHERE run_id = ? AND completed = 0 ORDER BY path",
+            (run_id,))]
+        return CheckSelection("full", files, total, run_id, total - len(files), probe_bytes)
+
+    def recover_runs(self) -> None:
+        # The caller must hold check_operation: no active scanner may be marked stopped.
+        with self.connection:
+            self.connection.execute("""UPDATE check_runs SET status = 'stopped', finished_at = COALESCE(
+                (SELECT MAX(checked_at) FROM checks WHERE run_id = check_runs.id), started_at)
+                WHERE status IS NULL""")
+
+    def start_run(self, mode: str, candidates: int, selected: int, probe_bytes: int | None = None,
+                  resume_of: int | None = None, files: list[DiskFile] | None = None) -> int:
         with self.connection:
             cursor = self.connection.execute("""INSERT INTO check_runs
-                (started_at, mode, total_candidates, selected_count) VALUES (?, ?, ?, ?)""",
-                (datetime.now(timezone.utc).isoformat(timespec="microseconds"), mode, candidates, selected))
+                (started_at, mode, total_candidates, selected_count, probe_bytes, resume_of)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (datetime.now(timezone.utc).isoformat(timespec="microseconds"), mode, candidates, selected,
+                 probe_bytes, resume_of))
+            if files is not None:
+                self.connection.executemany(
+                    "INSERT INTO full_run_files(run_id, path, name, size) VALUES (?, ?, ?, ?)",
+                    [(cursor.lastrowid, file.path, file.name, file.size) for file in files])
         return cursor.lastrowid
 
     def finish_run(self, run_id: int, status: str) -> CheckRun:
@@ -240,13 +283,14 @@ class HistoryStore:
 
     def runs(self, run_id: int | None = None) -> list[CheckRun]:
         query = """SELECT id, started_at, finished_at, mode, total_candidates, selected_count,
-            checked_count, success_count, failed_count, unknown_count, status FROM check_runs"""
+            checked_count, success_count, failed_count, unknown_count, status, probe_bytes, resume_of FROM check_runs"""
         if run_id is not None:
             query += " WHERE id = ?"
         return [CheckRun(*row) for row in self.connection.execute(
             query + " ORDER BY id", () if run_id is None else (run_id,))]
 
-    def record(self, path: str, result: CheckResult, run_id: int | None = None) -> HistoryEntry:
+    def record(self, path: str, result: CheckResult, run_id: int | None = None,
+               full_run_id: int | None = None) -> HistoryEntry:
         checked_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         with self.connection:
             self.connection.execute(
@@ -261,6 +305,9 @@ class HistoryStore:
                     success_count = success_count + ?, failed_count = failed_count + ?,
                     unknown_count = unknown_count + ? WHERE id = ?""",
                     (result.ok is True, result.ok is False, result.ok is None, run_id))
+            if full_run_id is not None:
+                self.connection.execute("UPDATE full_run_files SET completed = ? WHERE run_id = ? AND path = ?",
+                    (not needs_full_retry(result), full_run_id, path))
         return HistoryEntry(path, checked_at, result, run_id)
 
     def entries(self, paths: list[str] | None = None, latest: bool = False,
@@ -286,6 +333,16 @@ class HistoryStore:
                 for path, checked_at, ok, note, code, requested, received, duration, ranged, reason, run_id in rows]
 
 
+def needs_full_retry(result: CheckResult) -> bool:
+    return result.ok is None or result.note in NETWORK_FAILURE_NOTES
+
+
+def full_progress_report(selection: CheckSelection) -> str:
+    return (f"Полная проверка #{selection.full_run_id}. Завершено {selection.completed_count} "
+            f"из {selection.total_candidates}. Осталось {selection.total_candidates - selection.completed_count}. "
+            f"Объём чтения: {selection.probe_bytes} байт")
+
+
 def sample_size(candidates: int, percent: float | None = None, count: int | None = None) -> int:
     if percent is not None and count is not None:
         raise ValueError("Процент и количество файлов нельзя указать вместе")
@@ -300,8 +357,9 @@ def sample_size(candidates: int, percent: float | None = None, count: int | None
 
 
 def run_report(run: CheckRun) -> str:
+    continuation = f"продолжение #{run.resume_of}; " if run.resume_of is not None else ""
     return (f"Запуск #{run.id}; режим: {MODE_LABELS.get(run.mode, run.mode)}; "
-            f"кандидатов: {run.total_candidates}; выбрано: {run.selected_count}; "
+            f"{continuation}кандидатов: {run.total_candidates}; выбрано: {run.selected_count}; "
             f"проверено: {run.checked_count}; доступно: {run.success_count}; "
             f"недоступно: {run.failed_count}; неопределённо: {run.unknown_count}; "
             f"длительность: {run.duration:.2f} с; статус: {run.status or 'выполняется'}")
@@ -850,13 +908,35 @@ def scan(
     probe_bytes: int = DEFAULT_PROBE_BYTES,
     mode: str = "full",
     total_candidates: int | None = None,
+    restart_full: bool = False,
 ) -> None:
-    """Check the supplied files; commit each result before notifying the UI."""
+    """Resume full checks; commit each result and queue update before notifying the UI."""
     problem = None
     try:
+        if restart_full and mode != "full":
+            raise ValueError("Начать заново можно только полную проверку")
         with check_operation(history_path), HistoryStore(history_path) as history:
+            history.recover_runs()
             files = list({file.path: file for file in files}.values())
-            run_id = history.start_run(mode, len(files) if total_candidates is None else total_candidates, len(files))
+            selection = CheckSelection(mode, files, len(files) if total_candidates is None else total_candidates)
+            resume_of = None
+            if mode == "full":
+                previous = history.full_selection() if not restart_full else None
+                if previous is not None and previous.files:
+                    selection = previous
+                    files = previous.files
+                    probe_bytes = previous.probe_bytes
+                    resume_of = previous.full_run_id
+                else:
+                    selection = CheckSelection("full", files, len(files), probe_bytes=probe_bytes)
+            run_id = history.start_run(mode, selection.total_candidates, len(files),
+                                       probe_bytes if mode == "full" else None, resume_of,
+                                       files if mode == "full" and resume_of is None else None)
+            if mode == "full":
+                selection = replace(selection, full_run_id=resume_of or run_id)
+            events.put(("selection", selection))
+            if mode == "full":
+                events.put(("progress", selection))
             try:
                 if files and not stop.is_set():
                     client = DiskProbe(token, stop, workers, probe_bytes)
@@ -882,8 +962,11 @@ def scan(
                                     except Exception:
                                         problem = "Непредвиденная ошибка проверки"
                                         result = CheckResult(None, problem, failure_reason=problem)
-                                    entry = history.record(file.path, result, run_id)
+                                    entry = history.record(file.path, result, run_id, selection.full_run_id)
                                     events.put(("result", entry))
+                                    if mode == "full" and not needs_full_retry(result):
+                                        selection = replace(selection, completed_count=selection.completed_count + 1)
+                                        events.put(("progress", selection))
                                 if stop.is_set():
                                     for future in running:
                                         future.cancel()
@@ -936,8 +1019,12 @@ def run_cli(
     sample_percent: float | None = None,
     sample_count: int | None = None,
     seed: int | None = None,
+    restart_full: bool = False,
 ) -> int:
     paths = paths or []
+    if restart_full and (command != "check" or paths or mode not in (None, "full")):
+        print("--restart используется только с полной проверкой без --path", file=sys.stderr)
+        return 2
     try:
         with HistoryStore(history_path) as history:
             if command == "history":
@@ -966,22 +1053,29 @@ def run_cli(
     if command == "list":
         target, arguments = load_files, (token, events, stop, history_path)
     else:
-        print(f"Всего в БД: {counts[0]}; ранее доступных: {counts[1]}; ранее недоступных: {counts[2]}; "
-              f"без достоверного результата: {counts[3]}; выбрано: {len(files)}", flush=True)
         target, arguments = scan, (token, files, events, stop, workers, history_path, probe_bytes,
-                                   selection.mode, selection.total_candidates)
+                                   selection.mode, selection.total_candidates, restart_full)
     thread = threading.Thread(target=target, args=arguments)
     thread.start()
     results: dict[str, CheckResult] = {}
     found = 0
     error = None
     report = None
+    progress = None
     while True:
         try:
             kind, payload = events.get()
             if kind == "file":
                 found += 1
                 print(payload.path, flush=True)
+            elif kind == "selection":
+                files = payload.files
+                print(f"Всего в БД: {counts[0]}; ранее доступных: {counts[1]}; ранее недоступных: {counts[2]}; "
+                      f"без достоверного результата: {counts[3]}; выбрано: {len(files)}", flush=True)
+            elif kind == "progress":
+                if progress is None:
+                    print(full_progress_report(payload), flush=True)
+                progress = payload
             elif kind == "result":
                 result = payload.result
                 results[payload.path] = result
@@ -1010,6 +1104,8 @@ def run_cli(
     failed = sum(1 for result in results.values() if result.ok is False)
     if report is not None:
         print(run_report(report))
+    if progress is not None:
+        print(full_progress_report(progress))
     if error:
         print(error, file=sys.stderr)
         return 2
@@ -1030,6 +1126,42 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
         print("Tkinter отсутствует. Установите python3-tk или используйте --cli.", file=sys.stderr)
         return 2
 
+    def make_sortable(tree, values_for_column):
+        columns = tree.cget("displaycolumns")
+        if columns == ("#all",):
+            columns = tree.cget("columns")
+        if "tree" in map(str, tree.tk.splitlist(tree.cget("show"))):
+            columns = ("#0", *columns)
+        headings = {column: tree.heading(column, "text") for column in columns}
+        active_column, descending = None, False
+
+        def reset():
+            nonlocal active_column, descending
+            active_column, descending = None, False
+            for column, text in headings.items():
+                tree.heading(column, text=text)
+
+        def sort(column):
+            nonlocal active_column, descending
+            descending = not descending if active_column == column else False
+            active_column = column
+            values = values_for_column(column)
+            present, missing = [], []
+            for iid in tree.get_children():
+                value = values[iid]
+                if value is None or value == "":
+                    missing.append(iid)
+                else:
+                    present.append((value.casefold() if isinstance(value, str) else value, iid))
+            present.sort(key=lambda item: item[0], reverse=descending)
+            tree.set_children("", *(iid for _value, iid in present), *missing)
+            for name, text in headings.items():
+                tree.heading(name, text=text + (" ↓" if descending else " ↑") if name == column else text)
+
+        for column in columns:
+            tree.heading(column, command=lambda column=column: sort(column))
+        return reset
+
     class DiskCheckWindow:
         def __init__(self, root: "tk.Tk") -> None:
             self.root = root
@@ -1044,16 +1176,23 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.sample_unit_var = tk.StringVar(value="Процент")
             self.sample_var = tk.StringVar(value="10")
             self.preview_var = tk.StringVar()
+            self.progress_var = tk.StringVar()
+            self.full_progress: CheckSelection | None = None
             self.catalog_counts = (0, 0, 0, 0)
             self.last_run: CheckRun | None = None
             self.events: queue.Queue[tuple[str, object]] = queue.Queue()
             self.stop_event = threading.Event()
             self.worker: threading.Thread | None = None
+            self.download_stop_event = threading.Event()
+            self.download_worker: threading.Thread | None = None
+            self.downloading = False
+            self.download_owns_status = False
             self.files: dict[str, DiskFile] = {}
             self.results: dict[str, CheckResult] = {}
             self.checked_at: dict[str, str] = {}
             self.ids: dict[str, str] = {}
             self.running = False
+            self.stopping = False
             self.closing = False
             self.operation = ""
 
@@ -1078,6 +1217,9 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.stop_btn.pack(side="left", padx=(0, 6))
             actions = ttk.Frame(frame)
             actions.pack(fill="x", pady=(8, 0))
+            self.restart_btn = ttk.Button(actions, text="Начать заново",
+                                          command=lambda: self.start(restart_full=True), state="disabled")
+            self.restart_btn.pack(side="left", padx=(0, 6))
             self.history_btn = ttk.Button(actions, text="История", command=self.show_history)
             self.history_btn.pack(side="left", padx=(0, 6))
             self.runs_btn = ttk.Button(actions, text="Запуски", command=self.show_runs)
@@ -1107,6 +1249,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             summary.pack(fill="x", pady=(13, 9))
             ttk.Label(summary, textvariable=self.preview_var, wraplength=1040).pack(anchor="w")
             ttk.Label(summary, textvariable=self.overview_var).pack(anchor="w")
+            ttk.Label(summary, textvariable=self.progress_var, wraplength=1040).pack(anchor="w")
             ttk.Label(summary, textvariable=self.state_var, wraplength=980).pack(anchor="w", pady=(4, 0))
 
             table_frame = ttk.Frame(frame)
@@ -1137,6 +1280,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             ):
                 self.tree.heading(column, text=heading)
                 self.tree.column(column, width=width, minwidth=80, anchor=anchor)
+            self.reset_sorting = make_sortable(self.tree, self.file_sort_values)
             scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
             scroll_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
             self.tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
@@ -1181,15 +1325,21 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
         def selection_changed(self, _event=None) -> None:
             count = len(self.tree.selection())
             self.selection_var.set(f"Выбрано строк: {count}" if count else "Строки не выбраны")
-            self.manual_btn.configure(state="normal" if count and not self.running else "disabled")
+            self.manual_btn.configure(state="normal" if count and not (
+                self.running or self.stopping or self.closing) else "disabled")
+
+        def can_download(self) -> bool:
+            return not (self.downloading or self.stopping or self.closing or
+                        (self.running and self.operation == "load"))
 
         def show_download_menu(self, event) -> str:
             iid = self.tree.identify_row(event.y)
-            if not iid or self.running:
+            if not iid:
                 return "break"
             file = next(self.files[path] for path, row in self.ids.items() if row == iid)
             self.file_menu.delete(0, "end")
-            self.file_menu.add_command(label="Скачать", command=lambda: self.download(file))
+            self.file_menu.add_command(label="Скачать", command=lambda: self.download(file),
+                                       state="normal" if self.can_download() else "disabled")
             try:
                 self.file_menu.tk_popup(event.x_root, event.y_root)
             finally:
@@ -1197,13 +1347,22 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             return "break"
 
         def download(self, file: DiskFile) -> None:
-            if self.running:
+            if not self.can_download():
                 return
             token = self.get_token()
             if not token:
                 return
-            self.state_var.set(f"Получение ссылки для скачивания: {file.name}…")
-            self.launch("download", token, file=file)
+            self.downloading = True
+            self.download_stop_event = threading.Event()
+            self.download_owns_status = not self.running
+            if self.download_owns_status:
+                self.state_var.set(f"Получение ссылки для скачивания: {file.name}…")
+            self.update_controls()
+            self.download_worker = threading.Thread(
+                target=prepare_download,
+                args=(token, file, self.events, self.download_stop_event),
+            )
+            self.download_worker.start()
 
         def selected_mode(self) -> str:
             return next(mode for mode, label in MODE_LABELS.items() if label == self.mode_var.get())
@@ -1229,16 +1388,49 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                 options = self.sample_options()
                 selected = (sample_size(good, options.get("sample_percent"), options.get("sample_count"))
                             if mode == "random" else failed if mode == "failed" else total)
+                if mode == "full" and self.full_progress is not None:
+                    remaining = self.full_progress.total_candidates - self.full_progress.completed_count
+                    if remaining:
+                        selected = remaining
             except ValueError:
                 selected = "— (проверьте объём выборки)"
                 valid = False
             self.preview_var.set(f"Всего в БД: {total}    Ранее доступных: {good}    Ранее недоступных: {failed}    "
                                  f"Без достоверного результата: {unknown}    Выбрано для проверки: {selected}")
-            if not self.running:
-                self.start_btn.configure(state="normal" if self.files and valid else "disabled")
-                self.mode_combo.configure(state="readonly")
-                self.sample_unit_combo.configure(state="readonly" if mode == "random" else "disabled")
-                self.sample_entry.configure(state="normal" if mode == "random" else "disabled")
+            idle = not (self.running or self.stopping or self.closing)
+            self.start_btn.configure(state="normal" if idle and self.files and valid else "disabled")
+            self.restart_btn.configure(state="normal" if idle and self.files and mode == "full" else "disabled")
+            self.mode_combo.configure(state="readonly" if idle else "disabled")
+            self.sample_unit_combo.configure(state="readonly" if idle and mode == "random" else "disabled")
+            self.sample_entry.configure(state="normal" if idle and mode == "random" else "disabled")
+
+        def update_controls(self) -> None:
+            idle = not (self.running or self.stopping or self.closing)
+            self.load_btn.configure(state="normal" if idle else "disabled")
+            self.stop_btn.configure(state="normal" if (self.running or self.downloading) and not (
+                self.stopping or self.closing) else "disabled")
+            self.export_btn.configure(state="normal" if idle and self.files else "disabled")
+            self.history_btn.configure(state="normal" if idle else "disabled")
+            self.runs_btn.configure(state="normal" if idle else "disabled")
+            self.token_entry.configure(state="normal" if idle else "disabled")
+            if self.file_menu.index("end") is not None:
+                self.file_menu.entryconfigure(0, state="normal" if self.can_download() else "disabled")
+            self.selection_changed()
+            self.preview_selection()
+
+        def file_sort_values(self, column: str) -> dict:
+            values = {}
+            for path, iid in self.ids.items():
+                file = self.files[path]
+                result = self.results.get(path)
+                checked = self.checked_at.get(path)
+                values[iid] = {
+                    "#0": 2 if result is None or result.ok is None else 1 if result.ok else 0,
+                    "name": file.name, "folder": file.folder, "size": file.size,
+                    "checked": datetime.fromisoformat(checked) if checked else None,
+                    "duration": result.duration_ms if result else None,
+                }[column]
+            return values
 
         def selected_paths(self) -> list[str]:
             selected = set(self.tree.selection())
@@ -1274,12 +1466,14 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.checked_at.clear()
             self.ids.clear()
             self.tree.delete(*self.tree.get_children())
+            self.reset_sorting()
 
         def restore_catalog(self) -> None:
             with HistoryStore(history_path) as history:
                 files = history.files()
                 entries = history.entries(latest=True)
                 self.catalog_counts = history.catalog_counts()
+                self.display_full_progress(history.full_selection())
             self.clear_files()
             for file in files:
                 self.add_file(file)
@@ -1291,30 +1485,24 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             if files:
                 self.state_var.set("Сохранённый список загружен. Обновите список или запустите проверку.")
 
+        def display_full_progress(self, selection: CheckSelection | None) -> None:
+            self.full_progress = selection
+            self.progress_var.set(full_progress_report(selection) if selection is not None else "")
+
         def launch(self, operation: str, token: str, selection: CheckSelection | None = None,
-                   file: DiskFile | None = None) -> None:
+                   restart_full: bool = False) -> None:
             self.operation = operation
             self.stop_event = threading.Event()
             self.running = True
             self.last_run = None
-            self.load_btn.configure(state="disabled")
-            self.start_btn.configure(state="disabled")
-            self.stop_btn.configure(state="normal")
-            self.export_btn.configure(state="disabled")
-            self.history_btn.configure(state="disabled")
-            self.runs_btn.configure(state="disabled")
-            self.manual_btn.configure(state="disabled")
-            self.mode_combo.configure(state="disabled")
-            self.sample_unit_combo.configure(state="disabled")
-            self.sample_entry.configure(state="disabled")
-            self.token_entry.configure(state="disabled")
+            self.download_owns_status = False
+            self.update_controls()
             if operation == "load":
                 target, arguments = load_files, (token, self.events, self.stop_event, history_path)
-            elif operation == "download":
-                target, arguments = prepare_download, (token, file, self.events, self.stop_event)
             else:
                 target, arguments = scan, (token, selection.files, self.events, self.stop_event, workers,
-                                           history_path, probe_bytes, selection.mode, selection.total_candidates)
+                                           history_path, probe_bytes, selection.mode, selection.total_candidates,
+                                           restart_full)
             self.worker = threading.Thread(
                 target=target,
                 args=arguments,
@@ -1322,7 +1510,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.worker.start()
 
         def load(self) -> None:
-            if self.running:
+            if self.running or self.stopping or self.closing:
                 return
             token = self.get_token()
             if not token:
@@ -1332,8 +1520,8 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.state_var.set("Получение полного списка файлов…")
             self.launch("load", token)
 
-        def start(self, manual: bool = False) -> None:
-            if self.running or not self.files:
+        def start(self, manual: bool = False, restart_full: bool = False) -> None:
+            if self.running or self.stopping or self.closing or not self.files:
                 return
             if manual and not self.selected_paths():
                 return
@@ -1349,22 +1537,18 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             token = self.get_token() if files else self.token_var.get().strip()
             if files and not token:
                 return
-            for file in files:
-                self.results.pop(file.path, None)
-                self.tree.item(self.ids[file.path], image=self.icons["pending"])
-                self.tree.set(self.ids[file.path], "note", "Ожидает проверки")
-                self.tree.set(self.ids[file.path], "received", "—")
-                self.tree.set(self.ids[file.path], "duration", "—")
-                self.tree.set(self.ids[file.path], "http", "—")
-            self.update_counts()
-            self.state_var.set(f"Проверка файлов: {len(files)}…")
-            self.launch("check", token, selection)
+            self.state_var.set("Подготовка проверки…")
+            self.launch("check", token, selection, restart_full)
 
         def cancel(self) -> None:
-            if self.running:
+            if self.running or self.downloading:
+                self.stopping = True
                 self.stop_event.set()
-                self.stop_btn.configure(state="disabled")
-                self.state_var.set("Отмена скачивания…" if self.operation == "download" else "Остановка проверок…")
+                self.download_stop_event.set()
+                if not self.running:
+                    self.download_owns_status = True
+                self.update_controls()
+                self.state_var.set("Остановка проверок…" if self.running else "Отмена скачивания…")
 
         def update_counts(self) -> None:
             ok = sum(result.ok is True for result in self.results.values())
@@ -1384,7 +1568,8 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                     break
                 if kind == "download":
                     href, problem = payload
-                    if self.closing or self.stop_event.is_set():
+                    cancelled = self.closing or self.download_stop_event.is_set()
+                    if cancelled:
                         problem = None
                     elif not problem:
                         try:
@@ -1392,12 +1577,33 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                                 problem = "Не удалось открыть браузер для скачивания"
                         except (webbrowser.Error, OSError):
                             problem = "Не удалось открыть браузер для скачивания"
-                    kind, payload = "finished", problem
-                if kind == "file":
+                    self.downloading = False
+                    if self.download_owns_status and not self.running:
+                        self.state_var.set(f"Ошибка: {problem}" if problem else
+                                           "Скачивание отменено" if cancelled else "Ссылка открыта в браузере")
+                    if problem and not self.closing:
+                        messagebox.showerror("Скачивание", problem)
+                elif kind == "file":
                     file = payload
                     if file.path in self.ids:
                         continue
                     self.add_file(file)
+                    changed = True
+                elif kind == "selection":
+                    for file in payload.files:
+                        if file.path not in self.ids:
+                            self.add_file(file)
+                        self.results.pop(file.path, None)
+                        self.tree.item(self.ids[file.path], image=self.icons["pending"])
+                        self.tree.set(self.ids[file.path], "note", "Ожидает проверки")
+                        self.tree.set(self.ids[file.path], "received", "—")
+                        self.tree.set(self.ids[file.path], "duration", "—")
+                        self.tree.set(self.ids[file.path], "http", "—")
+                    if not (self.stopping or self.closing):
+                        self.state_var.set(f"Проверка файлов: {len(payload.files)}…")
+                    changed = True
+                elif kind == "progress":
+                    self.display_full_progress(payload)
                     changed = True
                 elif kind == "result":
                     self.display_result(payload)
@@ -1413,6 +1619,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                             with HistoryStore(history_path) as history:
                                 entries = history.entries(latest=True)
                                 self.catalog_counts = history.catalog_counts()
+                                self.display_full_progress(history.full_selection())
                             for entry in entries:
                                 self.display_result(entry)
                             for path, iid in self.ids.items():
@@ -1422,27 +1629,13 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                         if self.operation == "load":
                             self.clear_files()
                         payload = "Не удалось прочитать сохранённые результаты"
-                    self.load_btn.configure(state="normal")
-                    self.start_btn.configure(state="normal" if self.files else "disabled")
-                    self.stop_btn.configure(state="disabled")
-                    self.export_btn.configure(state="normal" if self.files else "disabled")
-                    self.history_btn.configure(state="normal")
-                    self.runs_btn.configure(state="normal")
-                    self.token_entry.configure(state="normal")
-                    self.selection_changed()
                     if payload:
                         self.state_var.set(f"Ошибка: {payload}" +
                                            (f". {run_report(self.last_run)}" if self.last_run is not None else ""))
                         if not self.closing:
-                            if self.operation == "download":
-                                messagebox.showerror("Скачивание", str(payload))
-                            else:
-                                messagebox.showwarning("Проверка завершена с ошибкой", str(payload))
+                            messagebox.showwarning("Проверка завершена с ошибкой", str(payload))
                     elif self.last_run is not None:
                         self.state_var.set(run_report(self.last_run))
-                    elif self.operation == "download":
-                        self.state_var.set("Скачивание отменено" if self.stop_event.is_set() else
-                                           "Ссылка открыта в браузере")
                     elif self.stop_event.is_set():
                         self.state_var.set("Операция остановлена. Предыдущий полный список сохранён.")
                     elif self.operation == "load":
@@ -1450,7 +1643,11 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                     else:
                         self.state_var.set("Проверка завершена")
                     changed = True
-                    if self.closing:
+                if kind in ("download", "finished"):
+                    if not self.running and not self.downloading:
+                        self.stopping = False
+                    self.update_controls()
+                    if self.closing and not self.running and not self.downloading:
                         self.root.destroy()
                         return
             if changed:
@@ -1485,8 +1682,13 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             ):
                 tree.heading(column, text=heading)
                 tree.column(column, width=width, minwidth=60)
-            for row in history_rows(entries):
-                tree.insert("", 0, values=row, tags=("bad",) if row[2] == "Ошибка" else ())
+            sort_values = {}
+            for entry, row in zip(entries, history_rows(entries)):
+                iid = tree.insert("", 0, values=row, tags=("bad",) if row[2] == "Ошибка" else ())
+                sort_values[iid] = (datetime.fromisoformat(entry.checked_at), *row[1:])
+            make_sortable(tree, lambda column: {
+                iid: row[columns.index(column)] for iid, row in sort_values.items()
+            })
             vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
             horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
             tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
@@ -1516,11 +1718,21 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                     "Проверено", "Доступно", "Недоступно", "Неопределённо", "Длительность, с", "Статус")):
                 tree.heading(column, text=label)
                 tree.column(column, width=190 if column in ("started", "finished", "mode") else 110, minwidth=60)
+            sort_values = {}
             for run in reversed(runs):
-                tree.insert("", "end", iid=str(run.id), values=(run.id, local_time(run.started_at),
-                    local_time(run.finished_at) if run.finished_at else "—", MODE_LABELS.get(run.mode, run.mode),
+                duration = run.duration
+                row = (run.id, local_time(run.started_at),
+                    local_time(run.finished_at) if run.finished_at else "—", MODE_LABELS.get(run.mode, run.mode) +
+                    (f" — продолжение #{run.resume_of}" if run.resume_of is not None else ""),
                     run.total_candidates, run.selected_count, run.checked_count, run.success_count,
-                    run.failed_count, run.unknown_count, f"{run.duration:.2f}", run.status or "выполняется"))
+                    run.failed_count, run.unknown_count, f"{duration:.2f}", run.status or "выполняется")
+                tree.insert("", "end", iid=str(run.id), values=row)
+                sort_values[str(run.id)] = (run.id, datetime.fromisoformat(run.started_at),
+                    datetime.fromisoformat(run.finished_at) if run.finished_at else None,
+                    *row[3:10], duration, row[-1])
+            make_sortable(tree, lambda column: {
+                iid: row[columns.index(column)] for iid, row in sort_values.items()
+            })
             tree.bind("<Double-1>", lambda _event: self.show_history(int(tree.selection()[0])) if tree.selection() else None)
             vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
             horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
@@ -1532,8 +1744,8 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             frame.columnconfigure(0, weight=1)
 
         def close(self) -> None:
-            if self.running:
-                self.closing = True
+            self.closing = True
+            if self.running or self.downloading:
                 self.cancel()
             else:
                 self.root.destroy()
@@ -1603,6 +1815,7 @@ def main() -> int:
                         help=f"Лимит чтения файла в байтах (по умолчанию {DEFAULT_PROBE_BYTES})")
     parser.add_argument("--mode", choices=("failed", "random", "full"),
                         help="Режим проверки; без параметра — full")
+    parser.add_argument("--restart", action="store_true", help="Начать полную проверку заново вместо продолжения")
     sample = parser.add_mutually_exclusive_group()
     sample.add_argument("--sample-percent", type=float, help="Процент доступных файлов (1–100; по умолчанию 10)")
     sample.add_argument("--sample-count", type=int, help="Количество доступных файлов (больше нуля)")
@@ -1612,6 +1825,8 @@ def main() -> int:
         parser.error("--workers: ожидается число от 1 до 12")
     if args.probe_bytes <= 0:
         parser.error("--probe-bytes: ожидается число больше нуля")
+    if args.restart and (not args.cli or args.command != "check" or args.path or args.mode not in (None, "full")):
+        parser.error("--restart используется только с --cli check в полном режиме без --path")
     if not args.cli and (args.command or args.path):
         parser.error("command и --path используются вместе с --cli")
     check_options = any(value is not None for value in (args.mode, args.sample_percent, args.sample_count, args.seed))
@@ -1635,7 +1850,8 @@ def main() -> int:
             print("Укажите OAuth-токен через переменную YANDEX_DISK_TOKEN.", file=sys.stderr)
             return 2
         return run_cli(token, args.workers, command, args.path, probe_bytes=args.probe_bytes,
-                       mode=args.mode, sample_percent=args.sample_percent, sample_count=args.sample_count, seed=args.seed)
+                       mode=args.mode, sample_percent=args.sample_percent, sample_count=args.sample_count,
+                       seed=args.seed, restart_full=args.restart)
     return run_gui(args.workers, probe_bytes=args.probe_bytes)
 
 

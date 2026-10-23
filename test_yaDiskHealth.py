@@ -735,7 +735,7 @@ class WorkflowTests(unittest.TestCase):
                 with patch.object(mod.sys, "argv", ["yaDiskHealth.py", "--cli", "check", *arguments]):
                     self.assertEqual(mod.main(), 0)
                 cli.assert_called_with("fictional-test-token", workers, "check", [], probe_bytes=1024,
-                                       mode=None, sample_percent=None, sample_count=None, seed=None)
+                                       mode=None, sample_percent=None, sample_count=None, seed=None, restart_full=False)
             for workers in (0, 13):
                 with patch.object(mod.sys, "argv", ["yaDiskHealth.py", "--workers", str(workers)]), \
                         contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
@@ -748,7 +748,7 @@ class WorkflowTests(unittest.TestCase):
             with patch.object(mod.sys, "argv", ["yaDiskHealth.py", "--cli", "check", "--probe-bytes", "1234"]):
                 self.assertEqual(mod.main(), 0)
             cli.assert_called_once_with("fictional-test-token", 6, "check", [], probe_bytes=1234,
-                                        mode=None, sample_percent=None, sample_count=None, seed=None)
+                                        mode=None, sample_percent=None, sample_count=None, seed=None, restart_full=False)
             for value in ("0", "-1", "invalid"):
                 with patch.object(mod.sys, "argv", ["yaDiskHealth.py", "--cli", "check", "--probe-bytes", value]), \
                         contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
@@ -918,9 +918,9 @@ class WorkflowTests(unittest.TestCase):
         listing.assert_not_called()
         check.assert_called_once_with(self.files[0])
         events = self.drain()
-        self.assertEqual([kind for kind, _ in events], ["result", "run", "finished"])
+        self.assertEqual([kind for kind, _ in events], ["selection", "progress", "result", "progress", "run", "finished"])
         with mod.HistoryStore(self.database) as history:
-            self.assertEqual(history.entries(), [events[0][1]])
+            self.assertEqual(history.entries(), [events[2][1]])
         self.assertNotIn(b"fictional-test-token", self.database.read_bytes())
 
     def test_old_database_migration_preserves_ids_catalog_and_history(self):
@@ -1028,7 +1028,7 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual([row[index] for row in after], [row[index] for row in before], name)
             self.assertEqual([entry.result.ok for entry in history.entries()],
                              [True, False, False, False, False, None])
-            self.assertEqual(history.connection.execute("PRAGMA user_version").fetchone(), (1,))
+            self.assertEqual(history.connection.execute("PRAGMA user_version").fetchone(), (2,))
             run = history.runs(run_id)[0]
             self.assertEqual((run.checked_count, run.success_count, run.failed_count, run.unknown_count),
                              (6, 1, 4, 1))
@@ -1119,7 +1119,8 @@ class WorkflowTests(unittest.TestCase):
         listing.assert_not_called()
         events = self.drain()
         self.assertEqual(events[-1], ("finished", None))
-        self.assertEqual(len(events), len(files) + 2)
+        self.assertEqual(len([payload for kind, payload in events if kind == "result"]), len(files))
+        self.assertEqual([payload.completed_count for kind, payload in events if kind == "progress"][-1], 5)
         with mod.HistoryStore(self.database) as history:
             self.assertEqual(history.files(), sorted(files, key=lambda file: file.path))
             entries = history.entries()
@@ -1588,7 +1589,8 @@ class CheckModeTests(unittest.TestCase):
                                                "--sample-count", "7", "--seed", "42"]):
                 self.assertEqual(mod.main(), 0)
             self.assertEqual(cli.call_args.kwargs, {"probe_bytes": 1024, "mode": "random",
-                                                   "sample_percent": None, "sample_count": 7, "seed": 42})
+                                                   "sample_percent": None, "sample_count": 7, "seed": 42,
+                                                   "restart_full": False})
         invalid = (("--mode", "bad"), ("--mode", "full", "--seed", "1"),
                    ("--mode", "failed", "--sample-count", "1"),
                    ("--mode", "full", "--path", "disk:/a"),
@@ -1663,6 +1665,319 @@ class CheckModeTests(unittest.TestCase):
             self.assertEqual(history.runs()[-1].status, "completed")
             self.assertEqual(history.runs()[-1].checked_count, 1)
         self.assertNotIn(b"secret-url", self.database.read_bytes())
+
+
+class FullResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.database = Path(self.temp.name) / "history.sqlite3"
+        self.files = [mod.DiskFile(name, "disk:/" + name, 10) for name in "abc"]
+        self.good = mod.CheckResult(True, "Данные получены", 200)
+        with mod.HistoryStore(self.database) as history:
+            history.merge_files(self.files)
+
+    def scan(self, outcomes=None, stop_after=None, files=None, **options):
+        seen = []
+        events = queue.Queue()
+
+        def check(client, file):
+            seen.append((file, client.probe_bytes))
+            if len(seen) == stop_after:
+                client.stop.set()
+            return (outcomes or {}).get(file.path, self.good)
+
+        with patch.object(mod.DiskProbe, "check_file", check):
+            mod.scan("test-token", self.files if files is None else files, events, threading.Event(),
+                     1, self.database, **options)
+        messages = list(events.queue)
+        self.assertEqual(messages[-1], ("finished", None))
+        return seen, messages
+
+    def test_stop_reopen_and_resume_skip_completed_files_and_link_runs(self):
+        self.scan(stop_after=1)
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(len(history.entries()), 1)
+        seen, messages = self.scan()
+        self.assertEqual([file for file, _ in seen], self.files[1:])
+        with mod.HistoryStore(self.database) as history:
+            runs = history.runs()
+            self.assertEqual([run.checked_count for run in runs], [1, 2])
+            self.assertEqual([run.status for run in runs], ["stopped", "completed"])
+            self.assertEqual(runs[1].resume_of, runs[0].id)
+            self.assertEqual(len(history.entries()), 3)
+        progress = [payload for kind, payload in messages if kind == "progress"][-1]
+        self.assertEqual(progress.completed_count, 3)
+
+    def test_one_pass_retries_only_network_and_unknown_results_on_next_invocation(self):
+        extra = mod.DiskFile("d", "disk:/d", 10)
+        files = self.files + [extra]
+        outcomes = {"disk:/b": mod.CheckResult(False, "HTTP 403", 403),
+                    "disk:/c": mod.CheckResult(False, mod.NETWORK_FAILURE_NOTES[0]),
+                    "disk:/d": mod.CheckResult(None, "HTTP 429", 429)}
+        seen, messages = self.scan(outcomes, files=files)
+        self.assertEqual(len(seen), 4)
+        self.assertEqual([payload.completed_count for kind, payload in messages if kind == "progress"][-1], 2)
+        seen, _ = self.scan(files=files)
+        self.assertEqual([file for file, _ in seen], files[2:])
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual([run.checked_count for run in history.runs()], [4, 2])
+            self.assertIs(history.entries(["disk:/c"])[0].result.ok, False)
+
+    def test_snapshot_and_probe_size_survive_catalog_changes(self):
+        self.scan(stop_after=1, probe_bytes=4096)
+        changed = mod.DiskFile("renamed", "disk:/b", 20)
+        extra = mod.DiskFile("d", "disk:/d", 30)
+        with mod.HistoryStore(self.database) as history:
+            history.merge_files([changed, extra])
+            current = history.files()
+        seen, _ = self.scan(files=current, probe_bytes=16)
+        self.assertEqual(seen, [(file, 4096) for file in self.files[1:]])
+        seen, _ = self.scan(files=current, probe_bytes=16)
+        self.assertEqual(seen, [(file, 16) for file in current])
+
+    def test_restart_replaces_old_remainder_and_completed_check_starts_fresh(self):
+        self.scan(stop_after=1)
+        seen, _ = self.scan(stop_after=1, restart_full=True)
+        self.assertEqual([file for file, _ in seen], self.files[:1])
+        self.scan()
+        seen, _ = self.scan()
+        self.assertEqual([file for file, _ in seen], self.files)
+        with mod.HistoryStore(self.database) as history:
+            runs = history.runs()
+            self.assertIsNone(runs[1].resume_of)
+            self.assertEqual(runs[2].resume_of, runs[1].id)
+            self.assertIsNone(runs[3].resume_of)
+
+    def test_other_modes_do_not_advance_or_replace_full_check(self):
+        self.scan(stop_after=1)
+        self.scan(files=self.files[1:2], mode="manual")
+        seen, _ = self.scan()
+        self.assertEqual([file for file, _ in seen], self.files[1:])
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(history.runs()[-1].resume_of, history.runs()[0].id)
+
+    def test_legacy_run_without_snapshot_is_not_resumed(self):
+        with mod.HistoryStore(self.database) as history:
+            run_id = history.start_run("full", 3, 3)
+            history.record(self.files[0].path, self.good, run_id)
+            history.finish_run(run_id, "stopped")
+        seen, _ = self.scan()
+        self.assertEqual([file for file, _ in seen], self.files)
+        with mod.HistoryStore(self.database) as history:
+            self.assertIsNone(history.runs()[-1].resume_of)
+
+    def test_cli_resumes_and_restart_checks_all_files(self):
+        self.scan(stop_after=1)
+        requested = []
+
+        def get(url, **kwargs):
+            if url.endswith("/resources/download"):
+                requested.append(kwargs["params"]["path"])
+                return Response(200, {"href": "https://downloader.disk.yandex.ru/file"})
+            return Response(200, headers={"Content-Length": "10"}, body_size=10)
+
+        with patch.object(mod.requests.Session, "get", side_effect=get) as requests, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(mod.run_cli("token", 1, "check", history_path=self.database), 0)
+        self.assertEqual(requested, [file.path for file in self.files[1:]])
+        self.assertEqual(requests.call_count, 4)
+        self.assertIn("Завершено 3 из 3", output.getvalue())
+        self.scan(stop_after=1)
+        with patch.object(mod.DiskProbe, "check_file", return_value=self.good) as check, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mod.run_cli("token", 1, "check", history_path=self.database,
+                                         restart_full=True), 0)
+        self.assertEqual([call.args[0] for call in check.call_args_list], self.files)
+
+    def test_repeated_stops_keep_one_original_run_and_unique_progress(self):
+        self.scan(stop_after=1)
+        self.scan(stop_after=1)
+        seen, _ = self.scan()
+        self.assertEqual([file for file, _ in seen], self.files[2:])
+        with mod.HistoryStore(self.database) as history:
+            runs = history.runs()
+            self.assertEqual([run.resume_of for run in runs], [None, runs[0].id, runs[0].id])
+            self.assertEqual([run.checked_count for run in runs], [1, 1, 1])
+            self.assertEqual(history.full_selection().completed_count, 3)
+
+    def test_parallel_completion_out_of_order_leaves_only_interrupted_file(self):
+        events, stop = queue.Queue(), threading.Event()
+
+        def check(client, file):
+            if file == self.files[1]:
+                self.assertTrue(client.stop.wait(5))
+                return mod.CheckResult(None, "Остановлено")
+            return self.good
+
+        with patch.object(mod.DiskProbe, "check_file", check):
+            thread = threading.Thread(target=mod.scan, args=("token", self.files, events, stop, 3, self.database))
+            thread.start()
+            completed = set()
+            try:
+                while len(completed) < 2:
+                    kind, payload = events.get(timeout=5)
+                    if kind == "result" and payload.result.ok is True:
+                        completed.add(payload.path)
+            finally:
+                stop.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(completed, {"disk:/a", "disk:/c"})
+        seen, _ = self.scan()
+        self.assertEqual([file for file, _ in seen], self.files[1:2])
+
+    def test_snapshot_creation_rolls_back_run_before_any_requests(self):
+        with mod.HistoryStore(self.database) as history:
+            history.connection.execute("""CREATE TRIGGER reject_snapshot BEFORE INSERT ON full_run_files
+                WHEN NEW.path = 'disk:/b' BEGIN SELECT RAISE(ABORT, 'test failure'); END""")
+        events = queue.Queue()
+        with patch.object(mod.DiskProbe, "check_file") as check:
+            mod.scan("token", self.files, events, threading.Event(), 1, self.database)
+        check.assert_not_called()
+        self.assertEqual(list(events.queue), [("finished", "Не удалось сохранить историю проверок")])
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(history.runs(), [])
+            self.assertEqual(history.connection.execute("SELECT COUNT(*) FROM full_run_files").fetchone(), (0,))
+
+    def test_result_queue_and_counters_roll_back_together(self):
+        with mod.HistoryStore(self.database) as history:
+            history.connection.execute("""CREATE TRIGGER reject_completion BEFORE UPDATE ON full_run_files
+                BEGIN SELECT RAISE(ABORT, 'test failure'); END""")
+        events = queue.Queue()
+        with patch.object(mod.DiskProbe, "check_file", return_value=self.good):
+            mod.scan("token", self.files, events, threading.Event(), 1, self.database)
+        self.assertEqual(list(events.queue)[-1], ("finished", "Не удалось сохранить историю проверок"))
+        self.assertFalse(any(kind == "result" for kind, _ in events.queue))
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(history.entries(), [])
+            self.assertEqual(history.runs()[0].checked_count, 0)
+            self.assertEqual(history.full_selection().files, self.files)
+            history.connection.execute("DROP TRIGGER reject_completion")
+        seen, _ = self.scan()
+        self.assertEqual([file for file, _ in seen], self.files)
+
+    def test_crashed_process_resumes_from_last_committed_result(self):
+        marker = Path(self.temp.name) / "in-flight"
+        script = ("import queue, sys, threading, time\n"
+                  "from pathlib import Path\n"
+                  "import yaDiskHealth as m\n"
+                  "def check(client, file):\n"
+                  "    if file.path != 'disk:/a':\n"
+                  "        Path(sys.argv[2]).touch()\n"
+                  "        time.sleep(30)\n"
+                  "    return m.CheckResult(True, 'Данные получены', 200)\n"
+                  "m.DiskProbe.check_file = check\n"
+                  "with m.HistoryStore(sys.argv[1]) as history:\n"
+                  "    files = history.files()\n"
+                  "m.scan('test-token', files, queue.Queue(), threading.Event(), 1, sys.argv[1])\n")
+        process = subprocess.Popen([mod.sys.executable, "-B", "-c", script, str(self.database), str(marker)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   cwd=Path(mod.__file__).parent)
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "Child did not reach the second file")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+        with mod.HistoryStore(self.database) as history:
+            self.assertIsNone(history.runs()[0].status)
+            self.assertEqual(len(history.entries()), 1)
+        seen, _ = self.scan()
+        self.assertEqual([file for file, _ in seen], self.files[1:])
+        with mod.HistoryStore(self.database) as history:
+            first, second = history.runs()
+            self.assertEqual(first.status, "stopped")
+            self.assertEqual(first.finished_at, history.entries(run_id=first.id)[-1].checked_at)
+            self.assertEqual(second.resume_of, first.id)
+
+    def test_busy_process_cannot_mark_an_active_run_stopped(self):
+        self.scan(stop_after=1)
+        with mod.HistoryStore(self.database) as history:
+            with history.connection:
+                history.connection.execute("UPDATE check_runs SET status = NULL, finished_at = NULL")
+        events = queue.Queue()
+        with mod.check_operation(self.database), patch.object(mod.DiskProbe, "check_file") as check:
+            mod.scan("token", self.files, events, threading.Event(), 1, self.database)
+        check.assert_not_called()
+        self.assertEqual(list(events.queue), [("finished", "Другая проверка уже выполняется")])
+        with mod.HistoryStore(self.database) as history:
+            self.assertIsNone(history.runs()[0].status)
+            self.assertEqual(len(history.runs()), 1)
+
+    def legacy_database(self):
+        path = Path(self.temp.name) / "v1.sqlite3"
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            connection.executescript("""
+                CREATE TABLE files (path TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER);
+                CREATE TABLE checks (id INTEGER PRIMARY KEY, path TEXT NOT NULL, checked_at TEXT NOT NULL,
+                    ok INTEGER, http_code INTEGER, note TEXT NOT NULL);
+                CREATE TABLE check_runs (id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
+                    mode TEXT NOT NULL, total_candidates INTEGER NOT NULL, selected_count INTEGER NOT NULL,
+                    checked_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0, unknown_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT CHECK(status IN ('completed', 'stopped', 'error')));
+                INSERT INTO files VALUES ('disk:/old', 'old', 10);
+                INSERT INTO checks VALUES (17, 'disk:/old', '2026-10-18T10:00:00+00:00', 1, 200, 'Данные получены');
+                INSERT INTO check_runs (id, started_at, mode, total_candidates, selected_count, status)
+                    VALUES (7, '2026-10-18T10:00:00+00:00', 'full', 1, 1, 'stopped');
+                PRAGMA user_version = 1;
+            """)
+        return path
+
+    def test_version_two_migration_preserves_legacy_data_and_is_idempotent(self):
+        legacy = self.legacy_database()
+        for _ in range(2):
+            with mod.HistoryStore(legacy) as history:
+                self.assertEqual(history.connection.execute("PRAGMA user_version").fetchone(), (2,))
+                self.assertEqual(history.files(), [mod.DiskFile("old", "disk:/old", 10)])
+                self.assertEqual(history.runs()[0].id, 7)
+                self.assertIsNone(history.runs()[0].probe_bytes)
+                self.assertIsNone(history.full_selection())
+                self.assertEqual(history.connection.execute("SELECT id FROM checks").fetchall(), [(17,)])
+
+    def test_failed_version_two_migration_rolls_back_columns_table_and_version(self):
+        legacy = self.legacy_database()
+
+        class InterruptedMigration(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == "PRAGMA user_version = 2":
+                    raise sqlite3.OperationalError("test migration failure")
+                return super().execute(sql, *args)
+
+        connection = sqlite3.connect(legacy, factory=InterruptedMigration)
+        try:
+            with patch.object(mod.sqlite3, "connect", return_value=connection), self.assertRaises(sqlite3.Error):
+                mod.HistoryStore(legacy)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone(), (1,))
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(check_runs)")}
+            self.assertNotIn("probe_bytes", columns)
+            self.assertNotIn("resume_of", columns)
+            self.assertEqual(connection.execute("SELECT name FROM sqlite_master WHERE name = 'full_run_files'").fetchall(), [])
+            self.assertEqual(connection.execute("SELECT id FROM checks").fetchall(), [(17,)])
+        finally:
+            connection.close()
+        with mod.HistoryStore(legacy) as history:
+            self.assertEqual(history.connection.execute("PRAGMA user_version").fetchone(), (2,))
+
+    def test_cli_restart_is_forwarded_and_rejects_non_full_commands(self):
+        with patch.dict(mod.os.environ, {"YANDEX_DISK_TOKEN": "token"}), \
+                patch.object(mod, "run_cli", return_value=0) as cli:
+            for mode in ([], ["--mode", "full"]):
+                with patch.object(mod.sys, "argv", ["yaDiskHealth.py", "--cli", "check", "--restart", *mode]):
+                    self.assertEqual(mod.main(), 0)
+                self.assertIs(cli.call_args.kwargs["restart_full"], True)
+        invalid = ([], ["--cli", "list"], ["--cli", "history"],
+                   ["--cli", "check", "--mode", "failed"], ["--cli", "check", "--mode", "random"],
+                   ["--cli", "check", "--path", "disk:/a"])
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), patch.object(mod.sys, "argv", ["yaDiskHealth.py", "--restart", *arguments]), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                mod.main()
+            self.assertEqual(raised.exception.code, 2)
 
 
 class GuiWorkflowTests(unittest.TestCase):
@@ -1769,6 +2084,101 @@ class GuiWorkflowTests(unittest.TestCase):
                 self.assertEqual(mod.run_gui(6, database), 0)
             listing.assert_not_called()
             get.assert_not_called()
+
+    def test_reopened_full_check_resumes_without_resetting_completed_rows_and_can_restart(self):
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+            root = tk.Tk()
+        except Exception as error:
+            self.skipTest(f"Tkinter/display unavailable: {error}")
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        files = [mod.DiskFile(name, "disk:/" + name, 10) for name in "abc"]
+        good = mod.CheckResult(True, "Данные получены", 200, 10, 10, 100)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        seen = []
+        restarting = False
+
+        def widgets(parent):
+            for child in parent.winfo_children():
+                yield child
+                yield from widgets(child)
+
+        def wait_until(predicate):
+            deadline = time.monotonic() + 5
+            while not predicate() and time.monotonic() < deadline:
+                root.update()
+                time.sleep(0.005)
+            self.assertTrue(predicate())
+
+        def first_check(client, file):
+            client.stop.set()
+            return good
+
+        def check(client, file):
+            seen.append((file.path, client.probe_bytes))
+            if not restarting:
+                if file.path == "disk:/b":
+                    self.assertTrue(release.wait(5))
+                else:
+                    return mod.CheckResult(None, "HTTP 429", 429)
+            return good
+
+        with tempfile.TemporaryDirectory() as folder:
+            database = Path(folder) / "history.sqlite3"
+            with mod.HistoryStore(database) as history:
+                history.merge_files(files)
+            with patch.object(mod.DiskProbe, "check_file", first_check):
+                mod.scan("token", files, queue.Queue(), threading.Event(), 1, database, 4096)
+
+            def drive():
+                nonlocal restarting
+                controls = list(widgets(root))
+                buttons = {widget.cget("text"): widget for widget in controls if isinstance(widget, ttk.Button)}
+                tree = next(widget for widget in controls if isinstance(widget, ttk.Treeview))
+                labels = [widget for widget in controls if isinstance(widget, ttk.Label)]
+                token = next(widget for widget in controls if isinstance(widget, ttk.Entry))
+                mode = next(widget for widget in controls if isinstance(widget, ttk.Combobox))
+                token.insert(0, "token")
+                self.assertEqual(seen, [])
+                progress = next(widget for widget in labels if "Завершено 1 из 3" in widget.cget("text"))
+                self.assertIn("Осталось 2", progress.cget("text"))
+                first, second, _ = tree.get_children()
+                saved = (tree.item(first, "image"), tree.set(first, "checked"), tree.set(first, "note"))
+                buttons["Проверить"].invoke()
+                try:
+                    wait_until(lambda: tree.set(second, "note") == "Ожидает проверки")
+                    self.assertEqual((tree.item(first, "image"), tree.set(first, "checked"), tree.set(first, "note")), saved)
+                    self.assertIn("disabled", buttons["Начать заново"].state())
+                finally:
+                    release.set()
+                wait_until(lambda: "disabled" not in buttons["Проверить"].state())
+                self.assertEqual(seen, [("disk:/b", 4096), ("disk:/c", 4096)])
+                self.assertIn("Завершено 2 из 3", progress.cget("text"))
+                self.assertIn("Осталось 1", progress.cget("text"))
+                buttons["Запуски"].invoke()
+                runs_tree = [widget for widget in widgets(root) if isinstance(widget, ttk.Treeview)][1]
+                self.assertIn("продолжение #1", runs_tree.set(runs_tree.get_children()[0], "mode"))
+                mode.set("Только недоступные")
+                self.assertIn("disabled", buttons["Начать заново"].state())
+                mode.set("Полная проверка")
+                restarting = True
+                seen.clear()
+                buttons["Начать заново"].invoke()
+                wait_until(lambda: "disabled" not in buttons["Проверить"].state())
+                self.assertEqual(seen, [(file.path, 16) for file in files])
+                self.assertIn("Завершено 3 из 3", progress.cget("text"))
+                with mod.HistoryStore(database) as history:
+                    self.assertIsNone(history.runs()[-1].resume_of)
+
+            root.mainloop = drive
+            with patch.object(tk, "Tk", return_value=root), patch.object(mod.DiskProbe, "check_file", check), \
+                    patch.object(mod.requests.Session, "get") as get, patch("tkinter.messagebox.showwarning") as warning:
+                self.assertEqual(mod.run_gui(1, database, 16), 0)
+            get.assert_not_called()
+            warning.assert_not_called()
 
     def test_close_waits_for_stopped_run_to_be_saved(self):
         try:
@@ -2037,7 +2447,444 @@ class GuiDownloadTests(unittest.TestCase):
         return popup
 
     def wait_for_download(self):
-        self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+        if self.menu.index("end") is None:
+            self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+        else:
+            self.wait_until(lambda: self.menu.entrycget(0, "state") == "normal")
+
+    def click_heading(self, tree, column):
+        command = tree.heading(column, "command")
+        self.assertTrue(command, f"No sort command for {column}")
+        tree.tk.call(command)
+
+    def reload_catalog(self, files, entries=()):
+        with mod.HistoryStore(self.database) as history:
+            with history.connection:
+                history.connection.execute("DELETE FROM checks")
+                history.connection.execute("DELETE FROM files")
+            history.merge_files(files)
+            for entry in entries:
+                saved = history.record(entry.path, entry.result, entry.run_id)
+                with history.connection:
+                    history.connection.execute("UPDATE checks SET checked_at = ? WHERE path = ? AND checked_at = ?",
+                                               (entry.checked_at, entry.path, saved.checked_at))
+        with patch.object(mod.DiskProbe, "iter_files", return_value=iter(())):
+            self.buttons["Загрузить список"].invoke()
+            self.wait_for_download()
+
+    def table_names(self, tree=None):
+        tree = tree if tree is not None else self.tree
+        return tuple(tree.set(iid, "name") for iid in tree.get_children())
+
+    def test_download_during_check_keeps_check_running_and_its_status(self):
+        started, release = threading.Event(), threading.Event()
+
+        def check(file):
+            started.set()
+            release.wait(3)
+            return mod.CheckResult(True, "Данные получены", 206, 10, 10)
+
+        labels = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Label)]
+        with patch.object(mod.DiskProbe, "check_file", side_effect=check), \
+                patch.object(mod.DiskProbe, "download_url", return_value="https://downloader.disk.yandex.ru/x") as link, \
+                patch.object(mod.webbrowser, "open_new_tab", return_value=True) as browser:
+            self.buttons["Проверить"].invoke()
+            try:
+                self.assertTrue(started.wait(3))
+                self.wait_until(lambda: any(widget.cget("text").startswith("Проверка файлов:") for widget in labels))
+                status = next(widget for widget in labels if widget.cget("text").startswith("Проверка файлов:"))
+                text = status.cget("text")
+                self.popup(self.tree.get_children()[1]).assert_called_once_with(55, 65)
+                self.menu.invoke(0)
+                self.wait_until(lambda: browser.called)
+                self.assertIn("disabled", self.buttons["Проверить"].state())
+                self.assertNotIn("disabled", self.buttons["Остановить"].state())
+                self.assertEqual(status.cget("text"), text)
+                link.assert_called_once_with(self.files[1])
+            finally:
+                release.set()
+                self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(history.runs()[-1].checked_count, 2)
+
+    def test_check_can_start_and_finish_while_download_is_pending(self):
+        started, release = threading.Event(), threading.Event()
+
+        def download(file):
+            started.set()
+            release.wait(3)
+            return "https://downloader.disk.yandex.ru/x"
+
+        with patch.object(mod.DiskProbe, "download_url", side_effect=download), \
+                patch.object(mod.DiskProbe, "check_file", return_value=mod.CheckResult(True, "Данные получены")), \
+                patch.object(mod.webbrowser, "open_new_tab", return_value=True) as browser:
+            self.popup(self.tree.get_children()[0])
+            self.menu.invoke(0)
+            try:
+                self.assertTrue(started.wait(3))
+                self.assertNotIn("disabled", self.buttons["Проверить"].state())
+                self.buttons["Проверить"].invoke()
+                self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+                self.assertNotIn("disabled", self.buttons["Остановить"].state())
+                self.assertEqual(self.menu.entrycget(0, "state"), "disabled")
+                labels = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Label)]
+                status = next(widget for widget in labels if widget.cget("text").startswith("Запуск #"))
+                text = status.cget("text")
+                browser.assert_not_called()
+                release.set()
+                self.wait_for_download()
+                browser.assert_called_once()
+                self.assertEqual(status.cget("text"), text)
+                self.assertIn("disabled", self.buttons["Остановить"].state())
+            finally:
+                release.set()
+                self.wait_for_download()
+
+    def test_download_errors_leave_active_check_unchanged(self):
+        started, release = threading.Event(), threading.Event()
+
+        def check(file):
+            started.set()
+            release.wait(3)
+            return mod.CheckResult(True, "Данные получены")
+
+        with patch.object(mod.DiskProbe, "check_file", side_effect=check):
+            self.buttons["Проверить"].invoke()
+            try:
+                self.assertTrue(started.wait(3))
+                labels = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Label)]
+                self.wait_until(lambda: any(widget.cget("text").startswith("Проверка файлов:") for widget in labels))
+                status = next(widget for widget in labels if widget.cget("text").startswith("Проверка файлов:"))
+                text = status.cget("text")
+                for link_options in ({"side_effect": mod.DiskAPIError(403, "secret")},
+                                     {"return_value": "https://downloader.disk.yandex.ru/x"}):
+                    with self.subTest(link_options=link_options), \
+                            patch.object(mod.DiskProbe, "download_url", **link_options), \
+                            patch.object(mod.webbrowser, "open_new_tab", return_value=False), \
+                            patch("tkinter.messagebox.showerror") as error:
+                        self.popup(self.tree.get_children()[0])
+                        self.menu.invoke(0)
+                        self.wait_for_download()
+                        error.assert_called_once()
+                        self.assertEqual(error.call_args.args[0], "Скачивание")
+                        self.assertIn("disabled", self.buttons["Проверить"].state())
+                        self.assertNotIn("disabled", self.buttons["Остановить"].state())
+                        self.assertEqual(status.cget("text"), text)
+            finally:
+                release.set()
+                self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+
+    def test_stop_after_check_finishes_cancels_remaining_download(self):
+        started = threading.Event()
+
+        def prepare(token, file, events, stop):
+            started.set()
+            stop.wait(3)
+            events.put(("download", ("https://downloader.disk.yandex.ru/x", None)))
+
+        with patch.object(mod, "prepare_download", side_effect=prepare), \
+                patch.object(mod.DiskProbe, "check_file", return_value=mod.CheckResult(True, "OK")), \
+                patch.object(mod.webbrowser, "open_new_tab") as browser:
+            self.popup(self.tree.get_children()[0])
+            self.menu.invoke(0)
+            self.assertTrue(started.wait(3))
+            self.buttons["Проверить"].invoke()
+            self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+            self.buttons["Остановить"].invoke()
+            self.wait_for_download()
+            browser.assert_not_called()
+            labels = [widget.cget("text") for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Label)]
+            self.assertIn("Скачивание отменено", labels)
+
+    def test_stop_cancels_check_and_a_queued_download(self):
+        started, queued = threading.Event(), threading.Event()
+
+        def check(client, file):
+            started.set()
+            client.stop.wait(3)
+            return mod.CheckResult(None, "Остановлено")
+
+        def ready(token, file, events, stop):
+            events.put(("download", ("https://downloader.disk.yandex.ru/x", None)))
+            queued.set()
+
+        with patch.object(mod.DiskProbe, "check_file", check), \
+                patch.object(mod, "prepare_download", side_effect=ready) as download, \
+                patch.object(mod.webbrowser, "open_new_tab") as browser:
+            self.buttons["Проверить"].invoke()
+            self.assertTrue(started.wait(3))
+            self.popup(self.tree.get_children()[0])
+            self.menu.invoke(0)
+            self.assertTrue(queued.wait(3))
+            self.buttons["Остановить"].invoke()
+            self.popup(self.tree.get_children()[1])
+            self.assertEqual(self.menu.entrycget(0, "state"), "disabled")
+            self.menu.invoke(0)
+            self.assertIn("disabled", self.buttons["Проверить"].state())
+            self.wait_for_download()
+            browser.assert_not_called()
+            download.assert_called_once()
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(history.runs()[-1].status, "stopped")
+
+    def assert_close_waits_for_both_operations(self, download_first):
+        check_started, download_started = threading.Event(), threading.Event()
+        check_stopped, download_stopped = threading.Event(), threading.Event()
+        release_check, release_download = threading.Event(), threading.Event()
+
+        def check(client, file):
+            check_started.set()
+            if client.stop.wait(3):
+                check_stopped.set()
+            release_check.wait(3)
+            return mod.CheckResult(None, "Остановлено")
+
+        def download(client, file):
+            download_started.set()
+            if client.stop.wait(3):
+                download_stopped.set()
+            release_download.wait(3)
+            return "https://downloader.disk.yandex.ru/x"
+
+        with patch.object(mod.DiskProbe, "check_file", check), \
+                patch.object(mod.DiskProbe, "download_url", download), \
+                patch.object(mod.webbrowser, "open_new_tab") as browser, \
+                patch.object(self.root, "destroy") as destroy:
+            self.buttons["Проверить"].invoke()
+            try:
+                self.assertTrue(check_started.wait(3))
+                self.popup(self.tree.get_children()[0])
+                self.menu.invoke(0)
+                self.assertTrue(download_started.wait(3))
+                self.root.tk.call(self.root.protocol("WM_DELETE_WINDOW"))
+                self.assertTrue(check_stopped.wait(3))
+                self.assertTrue(download_stopped.wait(3))
+                (release_download if download_first else release_check).set()
+                flushed = threading.Event()
+                self.root.after(150, flushed.set)
+                self.wait_until(flushed.is_set)
+                destroy.assert_not_called()
+                self.assertIn("disabled", self.buttons["Проверить"].state())
+                release_check.set()
+                release_download.set()
+                self.wait_until(lambda: destroy.called)
+                browser.assert_not_called()
+            finally:
+                release_check.set()
+                release_download.set()
+                self.buttons["Остановить"].invoke()
+                self.wait_until(lambda: destroy.called)
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(history.runs()[-1].status, "stopped")
+
+    def test_close_waits_for_check_after_download_finishes(self):
+        self.assert_close_waits_for_both_operations(download_first=True)
+
+    def test_close_waits_for_download_after_check_finishes(self):
+        self.assert_close_waits_for_both_operations(download_first=False)
+
+    def test_main_table_sort_preserves_selection_and_clicked_file(self):
+        first, second = self.tree.get_children()
+        self.tree.selection_set(first)
+        self.tree.focus(first)
+        self.click_heading(self.tree, "name")
+        self.assertEqual(self.tree.get_children(), (first, second))
+        self.assertEqual(self.tree.heading("name", "text"), "Файл ↑")
+        self.click_heading(self.tree, "name")
+        self.assertEqual(self.tree.get_children(), (second, first))
+        self.assertEqual(self.tree.heading("name", "text"), "Файл ↓")
+        self.assertEqual(self.tree.selection(), (first,))
+        self.assertEqual(self.tree.focus(), first)
+        self.click_heading(self.tree, "#0")
+        self.assertEqual(self.tree.get_children(), (second, first))
+        self.assertEqual(self.tree.heading("name", "text"), "Файл")
+        self.popup(second)
+        with patch.object(mod.DiskProbe, "download_url", return_value="https://downloader.disk.yandex.ru/x") as link, \
+                patch.object(mod.webbrowser, "open_new_tab", return_value=True):
+            self.menu.invoke(0)
+            self.wait_for_download()
+        link.assert_called_once_with(self.files[1])
+        self.assertEqual(self.tree.selection(), (first,))
+
+    def test_all_main_columns_sort_raw_values_with_missing_values_last(self):
+        a = mod.DiskFile("Alpha", "disk:/z/Alpha", 2048)
+        b = mod.DiskFile("alpha", "disk:/a/alpha", 900)
+        c = mod.DiskFile("Бета", "disk:/я/Бета", None)
+        d = mod.DiskFile("ноль", "disk:/b/ноль", 0)
+        self.reload_catalog([a, b, c, d], [
+            mod.HistoryEntry(a.path, "2026-10-25T01:30:00+01:00", mod.CheckResult(True, "OK", duration_ms=20)),
+            mod.HistoryEntry(b.path, "2026-10-25T02:00:00+03:00", mod.CheckResult(False, "HTTP 403", 403, duration_ms=100)),
+            mod.HistoryEntry(d.path, "2026-10-25T00:30:00+00:00", mod.CheckResult(None, "Не подтверждён", duration_ms=0)),
+        ])
+        expected = {
+            "size": ((d, b, a, c), (a, b, d, c)),
+            "folder": ((b, d, a, c), (c, a, d, b)),
+            "name": ((a, b, c, d), (d, c, a, b)),
+            "checked": ((b, d, a, c), (d, a, b, c)),
+            "duration": ((d, a, b, c), (b, a, d, c)),
+            "#0": ((b, a, d, c), (d, c, a, b)),
+        }
+        self.assertEqual(set(expected), {"#0", *self.tree.cget("displaycolumns")})
+        for column, orders in expected.items():
+            heading = self.tree.heading(column, "text")
+            for arrow, order in zip(("↑", "↓"), orders):
+                with self.subTest(column=column, arrow=arrow):
+                    self.click_heading(self.tree, column)
+                    self.assertEqual(self.table_names(), tuple(file.name for file in order))
+                    self.assertEqual(self.tree.heading(column, "text"), f"{heading} {arrow}")
+
+    def test_results_keep_sorted_positions_until_another_heading_click(self):
+        first, second = self.tree.get_children()
+        self.click_heading(self.tree, "duration")
+        self.assertEqual(self.tree.get_children(), (second, first))
+        results = {self.files[0].path: mod.CheckResult(True, "OK", duration_ms=500),
+                   self.files[1].path: mod.CheckResult(True, "OK", duration_ms=5)}
+        with patch.object(mod.DiskProbe, "check_file", side_effect=lambda file: results[file.path]):
+            self.buttons["Проверить"].invoke()
+            self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+        self.assertEqual(self.tree.get_children(), (second, first))
+        self.assertEqual(int(self.tree.set(first, "duration")), 500)
+        self.click_heading(self.tree, "duration")
+        self.assertEqual(self.tree.get_children(), (first, second))
+
+    def test_loading_appends_new_rows_and_resets_sorting(self):
+        release, finish = threading.Event(), threading.Event()
+        files = [mod.DiskFile(name, "disk:/" + name, 10) for name in ("z", "m", "b")]
+
+        def listing():
+            yield from files[:2]
+            release.wait(3)
+            yield files[2]
+            finish.wait(3)
+
+        self.click_heading(self.tree, "name")
+        with patch.object(mod.DiskProbe, "iter_files", side_effect=listing), \
+                patch.object(mod, "prepare_download") as download:
+            self.buttons["Загрузить список"].invoke()
+            try:
+                self.wait_until(lambda: len(self.tree.get_children()) == 2)
+                self.assertEqual(self.tree.heading("name", "text"), "Файл")
+                self.click_heading(self.tree, "name")
+                self.assertEqual(self.table_names(), ("m", "z"))
+                self.popup(self.tree.get_children()[0])
+                self.assertEqual(self.menu.entrycget(0, "state"), "disabled")
+                self.menu.invoke(0)
+                download.assert_not_called()
+                release.set()
+                self.wait_until(lambda: len(self.tree.get_children()) == 3)
+                self.assertEqual(self.table_names(), ("m", "z", "b"))
+            finally:
+                release.set()
+                finish.set()
+                self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+        self.assertEqual(self.tree.heading("name", "text"), "Файл")
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(self.table_names(), tuple(file.name for file in history.files()))
+
+    def test_history_sorts_all_visible_columns_and_keeps_changes_and_tags(self):
+        with mod.HistoryStore(self.database) as history:
+            for _ in range(10):
+                run_id = history.start_run("full", 1, 1)
+                history.finish_run(run_id, "completed")
+        a = mod.DiskFile("Alpha", "disk:/Alpha", 10)
+        b = mod.DiskFile("alpha", "disk:/alpha", 10)
+        c = mod.DiskFile("Бета", "disk:/Бета", 10)
+        d = mod.DiskFile("delta", "disk:/delta", 10)
+        self.reload_catalog([a, b, c, d], [
+            mod.HistoryEntry(a.path, "2026-10-20T15:00:00.900000+00:00", mod.CheckResult(True, "one", duration_ms=100), 1),
+            mod.HistoryEntry(b.path, "2026-10-20T15:00:00.100000+00:00", mod.CheckResult(False, "two", 403, duration_ms=20), 10),
+            mod.HistoryEntry(a.path, "2026-10-20T15:00:00.500000+00:00", mod.CheckResult(False, "three", 403, duration_ms=0)),
+            mod.HistoryEntry(c.path, "2026-10-20T14:59:59+00:00", mod.CheckResult(None, "Остановлено"), 2),
+            mod.HistoryEntry(d.path, "2026-10-20T14:59:58+00:00", mod.CheckResult(True, "five", duration_ms=20), 2),
+        ])
+        self.buttons["История"].invoke()
+        tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        rows = {tree.set(iid, "note"): iid for iid in tree.get_children()}
+        original = {iid: tree.item(iid) for iid in tree.get_children()}
+        expected = {
+            "date": (("five", "Остановлено", "two", "three", "one"), ("one", "three", "two", "Остановлено", "five")),
+            "path": (("one", "three", "two", "five", "Остановлено"), ("Остановлено", "five", "one", "three", "two")),
+            "status": (("five", "one", "Остановлено", "three", "two"), ("three", "two", "Остановлено", "five", "one")),
+            "change": (("three", "two", "Остановлено", "five", "one"), ("three", "two", "Остановлено", "five", "one")),
+            "duration": (("three", "two", "five", "one", "Остановлено"), ("one", "two", "five", "three", "Остановлено")),
+            "run": (("one", "five", "Остановлено", "two", "three"), ("two", "five", "Остановлено", "one", "three")),
+        }
+        self.assertEqual(set(expected), set(tree.cget("displaycolumns")))
+        tree.selection_set(rows["three"])
+        for column, orders in expected.items():
+            for order in orders:
+                with self.subTest(column=column, order=order):
+                    self.click_heading(tree, column)
+                    self.assertEqual(tuple(tree.set(iid, "note") for iid in tree.get_children()), order)
+                    self.assertEqual(tree.selection(), (rows["three"],))
+        self.assertEqual({iid: tree.item(iid) for iid in tree.get_children()}, original)
+        self.assertEqual(tree.set(rows["three"], "change"), "Доступ не подтверждён")
+
+    def test_runs_sort_all_columns_with_numeric_counts_and_missing_finish(self):
+        runs = [
+            (1, "2026-10-20T10:00:00.500000+00:00", "2026-10-20T10:00:02.500000+00:00",
+             "full", 100, 20, 10, 9, 1, 0, "completed"),
+            (2, "2026-10-20T10:00:00.100000+00:00", "2026-10-20T10:00:10.100000+00:00",
+             "failed", 20, 9, 9, 0, 9, 0, "error"),
+            (10, "2026-10-19T10:00:00+00:00", None, "random", 9, 2, 0, 0, 0, 0, None),
+        ]
+        with mod.HistoryStore(self.database) as history:
+            with history.connection:
+                history.connection.executemany("""INSERT INTO check_runs
+                    (id, started_at, finished_at, mode, total_candidates, selected_count,
+                     checked_count, success_count, failed_count, unknown_count, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", runs)
+        self.buttons["Запуски"].invoke()
+        tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        expected = {
+            "id": ((1, 2, 10), (10, 2, 1)),
+            "started": ((10, 2, 1), (1, 2, 10)),
+            "finished": ((1, 2, 10), (2, 1, 10)),
+            "mode": ((1, 10, 2), (2, 10, 1)),
+            "candidates": ((10, 2, 1), (1, 2, 10)),
+            "selected": ((10, 2, 1), (1, 2, 10)),
+            "checked": ((10, 2, 1), (1, 2, 10)),
+            "success": ((2, 10, 1), (1, 2, 10)),
+            "failed": ((10, 1, 2), (2, 1, 10)),
+            "unknown": ((2, 1, 10), (2, 1, 10)),
+            "duration": ((1, 2, 10), (10, 2, 1)),
+            "status": ((1, 2, 10), (10, 2, 1)),
+        }
+        self.assertEqual(set(expected), set(tree.cget("columns")))
+        tree.selection_set("2")
+        for column, orders in expected.items():
+            heading = tree.heading(column, "text")
+            for arrow, order in zip(("↑", "↓"), orders):
+                with self.subTest(column=column, arrow=arrow):
+                    self.click_heading(tree, column)
+                    self.assertEqual(tuple(map(int, tree.get_children())), order)
+                    self.assertEqual(tree.heading(column, "text"), f"{heading} {arrow}")
+                    self.assertEqual(tree.selection(), ("2",))
+        tree.winfo_toplevel().destroy()
+        self.buttons["Запуски"].invoke()
+        reopened = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        self.assertEqual(reopened.heading("id", "text"), "№")
+        self.assertEqual(reopened.get_children(), ("10", "2", "1"))
+
+    def test_sorted_run_opens_its_own_results_with_sortable_headings(self):
+        with mod.HistoryStore(self.database) as history:
+            for file in self.files:
+                run_id = history.start_run("manual", 1, 1)
+                history.record(file.path, self.failure, run_id)
+                history.finish_run(run_id, "completed")
+        self.buttons["Запуски"].invoke()
+        tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        self.click_heading(tree, "id")
+        tree.selection_set(tree.get_children()[0])
+        command = tree.bind("<Double-1>").split("[", 1)[1].split()[0]
+        tree.tk.call(command, "")
+        results = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        self.assertIsNot(results, tree)
+        self.assertEqual(results.winfo_toplevel().title(), "Результаты запуска #1")
+        self.assertEqual([results.set(iid, "path") for iid in results.get_children()], [self.files[0].path])
+        for column in results.cget("displaycolumns"):
+            self.click_heading(results, column)
+            self.assertTrue(results.heading(column, "text").endswith(" ↑"))
 
     def test_oauth_link_opens_polygon_and_footer_is_absent(self):
         labels = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Label)]
@@ -2100,9 +2947,11 @@ class GuiDownloadTests(unittest.TestCase):
                 patch.object(mod.webbrowser, "open_new_tab", side_effect=open_tab) as browser, \
                 patch("tkinter.messagebox.showerror") as error:
             for _ in links:
+                self.popup(second)
                 self.menu.invoke(0)
-                self.assertIn("disabled", self.buttons["Проверить"].state())
-                self.popup(first).assert_not_called()
+                self.assertNotIn("disabled", self.buttons["Проверить"].state())
+                self.popup(first).assert_called_once_with(55, 65)
+                self.assertEqual(self.menu.entrycget(0, "state"), "disabled")
                 self.menu.invoke(0)
                 self.wait_for_download()
             self.assertEqual([call.args[0] for call in browser.call_args_list], links)
