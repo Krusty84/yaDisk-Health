@@ -1033,7 +1033,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
     class DiskCheckWindow:
         def __init__(self, root: "tk.Tk") -> None:
             self.root = root
-            root.title("Яндекс Диск — проверка доступности файлов")
+            root.title("yaDisk-Health. Проверка доступности файлов © 2026 Alexey Sedoykin (MIT)")
             root.geometry("1150x690")
             root.minsize(780, 420)
 
