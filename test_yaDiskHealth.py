@@ -2886,6 +2886,59 @@ class GuiDownloadTests(unittest.TestCase):
             self.click_heading(results, column)
             self.assertTrue(results.heading(column, "text").endswith(" ↑"))
 
+    def token_entry(self):
+        return next(widget for widget in self.widgets(self.root)
+                    if isinstance(widget, self.ttk.Entry) and widget.cget("show") == "•")
+
+    def test_token_paste_button_replaces_value_and_trims_whitespace(self):
+        entry = self.token_entry()
+        with patch.object(self.root, "clipboard_get", return_value=" \nfictional-pasted-token\r\n "):
+            self.buttons["Вставить"].invoke()
+            self.buttons["Вставить"].invoke()
+        self.assertEqual(entry.get(), "fictional-pasted-token")
+        self.assertEqual(entry.cget("show"), "•")
+        self.assertNotIn(b"fictional-pasted-token", self.database.read_bytes())
+
+    def test_token_paste_empty_clipboard_preserves_existing_value(self):
+        entry = self.token_entry()
+        original = entry.get()
+        for options in ({"return_value": " \n "},
+                        {"side_effect": self.tk.TclError("private-clipboard-detail")}):
+            with self.subTest(options=options), patch.object(self.root, "clipboard_get", **options), \
+                    patch("tkinter.messagebox.showwarning") as warning:
+                self.buttons["Вставить"].invoke()
+                self.assertEqual(entry.get(), original)
+                warning.assert_called_once()
+                self.assertNotIn("private-clipboard-detail", str(warning.call_args))
+
+    def test_token_paste_is_ignored_when_entry_is_disabled(self):
+        entry = self.token_entry()
+        original = entry.get()
+        entry.configure(state="disabled")
+        with patch.object(self.root, "clipboard_get") as clipboard:
+            self.buttons["Вставить"].invoke()
+            entry.event_generate("<<Paste>>")
+        clipboard.assert_not_called()
+        self.assertEqual(entry.get(), original)
+
+    def test_token_paste_shortcut_in_english_and_russian_on_macos(self):
+        if self.root.tk.call("tk", "windowingsystem") != "aqua":
+            self.skipTest("macOS keyboard bindings")
+        entry = self.token_entry()
+        self.root.deiconify()
+        self.root.update()
+        entry.focus_force()
+        self.root.update()
+        for shortcut in ("<Command-Key-v>", "<Command-Key-Cyrillic_em>", "<Command-Key-Cyrillic_EM>"):
+            with self.subTest(shortcut=shortcut):
+                entry.delete(0, "end")
+                with patch.object(self.root, "clipboard_get", return_value="fictional-pasted-token") as clipboard:
+                    # Dispatch synchronously; do not mix unrelated native key events
+                    # from the user's desktop into this synthetic keystroke.
+                    entry.event_generate(shortcut)
+                clipboard.assert_called_once()
+                self.assertEqual(entry.get(), "fictional-pasted-token")
+
     def test_oauth_link_opens_polygon_and_footer_is_absent(self):
         labels = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Label)]
         link = next(widget for widget in labels if widget.cget("text") == "OAuth-токен:")

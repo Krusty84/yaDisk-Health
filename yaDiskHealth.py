@@ -1209,6 +1209,12 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                 "https://yandex.ru/dev/disk/poligon#access_token"))
             self.token_entry = ttk.Entry(toolbar, textvariable=self.token_var, show="•", width=43)
             self.token_entry.pack(side="left", padx=(9, 10), fill="x", expand=True)
+            self.token_entry.bind("<<Paste>>", self.paste_token)
+            if sys.platform == "darwin":
+                for key in ("Cyrillic_em", "Cyrillic_EM"):
+                    self.token_entry.bind(f"<Command-Key-{key}>", self.paste_token)
+            self.paste_btn = ttk.Button(toolbar, text="Вставить", command=self.paste_token)
+            self.paste_btn.pack(side="left", padx=(0, 6))
             self.load_btn = ttk.Button(toolbar, text="Загрузить список", command=self.load)
             self.load_btn.pack(side="left", padx=(0, 6))
             self.start_btn = ttk.Button(toolbar, text="Проверить", command=self.start, state="disabled")
@@ -1313,6 +1319,21 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                         img.put(fill if dist_sq < 6.1 ** 2 else border, (x, y))
             return img
 
+        def paste_token(self, _event=None) -> str:
+            if self.token_entry.instate(("disabled",)):
+                return "break"
+            try:
+                token = self.root.clipboard_get().strip()
+            except tk.TclError:
+                token = ""
+            if not token:
+                messagebox.showwarning("Нет текста", "Скопируйте OAuth-токен в буфер обмена и повторите вставку.")
+                return "break"
+            self.token_var.set(token)
+            self.token_entry.icursor("end")
+            self.token_entry.focus_set()
+            return "break"
+
         def get_token(self) -> str:
             token = self.token_var.get().strip()
             if not token:
@@ -1413,6 +1434,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.history_btn.configure(state="normal" if idle else "disabled")
             self.runs_btn.configure(state="normal" if idle else "disabled")
             self.token_entry.configure(state="normal" if idle else "disabled")
+            self.paste_btn.configure(state="normal" if idle else "disabled")
             if self.file_menu.index("end") is not None:
                 self.file_menu.entryconfigure(0, state="normal" if self.can_download() else "disabled")
             self.selection_changed()
