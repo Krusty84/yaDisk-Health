@@ -1252,6 +1252,14 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.token_entry = ttk.Entry(toolbar, textvariable=self.token_var, show="•", width=43)
             self.token_entry.pack(side="left", padx=(9, 10), fill="x", expand=True)
             add_tooltip(self.token_entry, "Вставьте OAuth-токен с правом чтения Диска: cloud_api:disk.read.")
+            self.token_entry.bind("<<Paste>>", self.paste_token)
+            if sys.platform == "darwin":
+                for key in ("Cyrillic_em", "Cyrillic_EM"):
+                    self.token_entry.bind(f"<Command-Key-{key}>", self.paste_token)
+            self.paste_btn = ttk.Button(toolbar, text="Вставить", command=self.paste_token)
+            self.paste_btn.pack(side="left", padx=(0, 6))
+            add_tooltip(self.paste_btn, "Вставить OAuth-токен из буфера обмена, заменив содержимое поля. "
+                        "Пробелы и переводы строк по краям будут убраны.")
             self.load_btn = ttk.Button(toolbar, text="Загрузить список файлов", command=self.load)
             self.load_btn.pack(side="left", padx=(0, 6))
             add_tooltip(self.load_btn, "Получить список файлов с Яндекс Диска и обновить сохранённый список.")
