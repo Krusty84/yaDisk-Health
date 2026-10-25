@@ -1070,7 +1070,7 @@ def run_cli(
                 print(payload.path, flush=True)
             elif kind == "selection":
                 files = payload.files
-                print(f"Всего в БД: {counts[0]}; ранее доступных: {counts[1]}; ранее недоступных: {counts[2]}; "
+                print(f"Записей в БД: {counts[0]}; ранее доступных: {counts[1]}; ранее недоступных: {counts[2]}; "
                       f"без достоверного результата: {counts[3]}; выбрано: {len(files)}", flush=True)
             elif kind == "progress":
                 if progress is None:
@@ -1126,6 +1126,46 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
         print("Tkinter отсутствует. Установите python3-tk или используйте --cli.", file=sys.stderr)
         return 2
 
+    def add_tooltip(widget, text):
+        pending = None
+        popup = None
+
+        def hide(_event=None):
+            nonlocal pending, popup
+            if pending is not None:
+                widget.after_cancel(pending)
+                pending = None
+            if popup is not None:
+                popup.destroy()
+                popup = None
+
+        def show():
+            nonlocal pending, popup
+            pending = None
+            value = text() if callable(text) else text
+            popup = tk.Toplevel(widget.winfo_toplevel())
+            popup.withdraw()
+            popup.overrideredirect(True)
+            popup.attributes("-topmost", True)
+            ttk.Label(popup, text=value, justify="left", padding=(8, 5),
+                      wraplength=360, relief="solid", borderwidth=1).pack()
+            popup.update_idletasks()
+            x = min(widget.winfo_pointerx() + 12, widget.winfo_screenwidth() - popup.winfo_reqwidth() - 8)
+            y = widget.winfo_pointery() + 20
+            if y + popup.winfo_reqheight() > widget.winfo_screenheight() - 8:
+                y = widget.winfo_pointery() - popup.winfo_reqheight() - 8
+            popup.geometry(f"+{max(0, x)}+{max(0, y)}")
+            popup.deiconify()
+
+        def schedule(_event):
+            nonlocal pending
+            hide()
+            pending = widget.after(600, show)
+
+        widget.bind("<Enter>", schedule, add="+")
+        for event in ("<Leave>", "<ButtonPress>", "<KeyPress>", "<Escape>", "<FocusOut>", "<Unmap>", "<Destroy>"):
+            widget.bind(event, hide, add="+")
+
     def make_sortable(tree, values_for_column):
         columns = tree.cget("displaycolumns")
         if columns == ("#all",):
@@ -1170,13 +1210,14 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             root.minsize(780, 420)
 
             self.token_var = tk.StringVar(value=os.environ.get("YANDEX_DISK_TOKEN", ""))
-            self.overview_var = tk.StringVar(value="Найдено: 0    Доступно: 0    Ошибки: 0    Ожидают: 0")
+            self.overview_var = tk.StringVar(value="Файлов: 0    Доступно: 0    Ошибки: 0    Ожидают: 0")
             self.state_var = tk.StringVar(value="Введите OAuth-токен с правом cloud_api:disk.read")
             self.mode_var = tk.StringVar(value=MODE_LABELS["full"])
             self.sample_unit_var = tk.StringVar(value="Процент")
             self.sample_var = tk.StringVar(value="10")
             self.preview_var = tk.StringVar()
             self.progress_var = tk.StringVar()
+            self.stop_enabled_var = tk.BooleanVar(value=False)
             self.full_progress: CheckSelection | None = None
             self.catalog_counts = (0, 0, 0, 0)
             self.last_run: CheckRun | None = None
@@ -1207,37 +1248,40 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             token_link.pack(side="left")
             token_link.bind("<Button-1>", lambda _event: webbrowser.open_new_tab(
                 "https://yandex.ru/dev/disk/poligon#access_token"))
+            add_tooltip(token_link, "Открыть страницу получения OAuth-токена Яндекс Диска в браузере.")
             self.token_entry = ttk.Entry(toolbar, textvariable=self.token_var, show="•", width=43)
             self.token_entry.pack(side="left", padx=(9, 10), fill="x", expand=True)
-            self.token_entry.bind("<<Paste>>", self.paste_token)
-            if sys.platform == "darwin":
-                for key in ("Cyrillic_em", "Cyrillic_EM"):
-                    self.token_entry.bind(f"<Command-Key-{key}>", self.paste_token)
-            self.paste_btn = ttk.Button(toolbar, text="Вставить", command=self.paste_token)
-            self.paste_btn.pack(side="left", padx=(0, 6))
-            self.load_btn = ttk.Button(toolbar, text="Загрузить список", command=self.load)
+            add_tooltip(self.token_entry, "Вставьте OAuth-токен с правом чтения Диска: cloud_api:disk.read.")
+            self.load_btn = ttk.Button(toolbar, text="Загрузить список файлов", command=self.load)
             self.load_btn.pack(side="left", padx=(0, 6))
-            self.start_btn = ttk.Button(toolbar, text="Проверить", command=self.start, state="disabled")
-            self.start_btn.pack(side="left", padx=(0, 6))
+            add_tooltip(self.load_btn, "Получить список файлов с Яндекс Диска и обновить сохранённый список.")
+            self.stop_check = ttk.Checkbutton(toolbar, variable=self.stop_enabled_var,
+                                             command=self.update_controls, state="disabled")
+            self.stop_check.pack(side="left", padx=(0, 3))
+            add_tooltip(self.stop_check, "Отметьте во время работы, чтобы разрешить остановку. "
+                        "После завершения работы отметка сбрасывается.")
             self.stop_btn = ttk.Button(toolbar, text="Остановить", command=self.cancel, state="disabled")
             self.stop_btn.pack(side="left", padx=(0, 6))
+            add_tooltip(self.stop_btn, "Остановить текущую операцию. Сначала отметьте флажок слева. "
+                        "Уже сохранённые результаты останутся в истории.")
             actions = ttk.Frame(frame)
             actions.pack(fill="x", pady=(8, 0))
             self.restart_btn = ttk.Button(actions, text="Начать заново",
                                           command=lambda: self.start(restart_full=True), state="disabled")
             self.restart_btn.pack(side="left", padx=(0, 6))
-            self.history_btn = ttk.Button(actions, text="История", command=self.show_history)
+            add_tooltip(self.restart_btn, "Начать полную проверку всего списка заново. "
+                        "История сохранится. Доступно в полном режиме.")
+            self.history_btn = ttk.Button(actions, text="История проверок", command=self.show_runs)
             self.history_btn.pack(side="left", padx=(0, 6))
-            self.runs_btn = ttk.Button(actions, text="Запуски", command=self.show_runs)
-            self.runs_btn.pack(side="left", padx=(0, 6))
+            add_tooltip(self.history_btn, "Показать итоги прошлых проходов. "
+                        "Двойной щелчок по проходу открывает его результаты.")
             self.export_btn = ttk.Button(actions, text="CSV…", command=self.save_csv, state="disabled")
             self.export_btn.pack(side="left", padx=(0, 6))
+            add_tooltip(self.export_btn, "Сохранить текущую таблицу с результатами и причинами ошибок в CSV.")
             self.manual_btn = ttk.Button(actions, text="Проверить выбранные",
                                          command=lambda: self.start(manual=True), state="disabled")
             self.manual_btn.pack(side="left", padx=(0, 6))
-            ttk.Button(actions, text="Снять выбор", command=self.clear_selection).pack(side="left")
-            self.selection_var = tk.StringVar(value="Строки не выбраны")
-            ttk.Label(actions, textvariable=self.selection_var).pack(side="left", padx=10)
+            add_tooltip(self.manual_btn, "Выделите файлы в таблице, чтобы проверить только их, независимо от режима.")
 
             modes = ttk.Frame(frame)
             modes.pack(fill="x", pady=(8, 0))
@@ -1245,18 +1289,45 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.mode_combo = ttk.Combobox(modes, textvariable=self.mode_var, state="readonly", width=33,
                 values=tuple(MODE_LABELS[mode] for mode in ("failed", "random", "full")))
             self.mode_combo.pack(side="left", padx=(6, 12))
+            add_tooltip(self.mode_combo, "Полная проверка — весь список или сохранённый остаток.\n"
+                        "Только недоступные — файлы с ранее сохранённой ошибкой.\n"
+                        "Случайная проверка — часть ранее доступных файлов.")
             self.sample_unit_combo = ttk.Combobox(modes, textvariable=self.sample_unit_var,
                 values=("Процент", "Количество"), width=12, state="disabled")
             self.sample_unit_combo.pack(side="left", padx=(0, 6))
+            add_tooltip(self.sample_unit_combo, "Выберите процент или количество файлов для случайной проверки.")
             self.sample_entry = ttk.Entry(modes, textvariable=self.sample_var, width=8, state="disabled")
             self.sample_entry.pack(side="left")
+            add_tooltip(self.sample_entry, "Объём случайной проверки: процент от 1 до 100 "
+                        "или количество файлов больше нуля.")
+            self.start_btn = ttk.Button(modes, text="Проверить", command=self.start, state="disabled")
+            self.start_btn.pack(side="left", padx=(12, 0))
+            add_tooltip(self.start_btn, lambda: (
+                "Проверить оставшиеся файлы полной проверки. Временные ошибки будут проверены повторно."
+                if self.start_btn.cget("text") == "Продолжить проверку" else {
+                    "full": "Начать полную проверку сохранённого списка файлов.",
+                    "failed": "Повторно проверить файлы с ранее сохранённой ошибкой.",
+                    "random": "Проверить случайную часть ранее доступных файлов. Объём задаётся слева.",
+                }[self.selected_mode()]
+            ))
 
             summary = ttk.Frame(frame)
             summary.pack(fill="x", pady=(13, 9))
-            ttk.Label(summary, textvariable=self.preview_var, wraplength=1040).pack(anchor="w")
-            ttk.Label(summary, textvariable=self.overview_var).pack(anchor="w")
-            ttk.Label(summary, textvariable=self.progress_var, wraplength=1040).pack(anchor="w")
-            ttk.Label(summary, textvariable=self.state_var, wraplength=980).pack(anchor="w", pady=(4, 0))
+            preview_label = ttk.Label(summary, textvariable=self.preview_var, wraplength=1040)
+            preview_label.pack(anchor="w")
+            add_tooltip(preview_label, "Сохранённый список и результаты прошлых проверок. "
+                        "«Выбрано» — число файлов для следующего прохода.")
+            overview_label = ttk.Label(summary, textvariable=self.overview_var)
+            overview_label.pack(anchor="w")
+            add_tooltip(overview_label, "Результаты в текущей таблице. «Не проверено» включает файлы "
+                        "без подтверждённого результата и остановленные попытки.")
+            progress_label = ttk.Label(summary, textvariable=self.progress_var, wraplength=1040)
+            progress_label.pack(anchor="w")
+            add_tooltip(progress_label, "Общий прогресс полной проверки. В остатке остаются прерванные попытки, "
+                        "сетевые ошибки и неопределённые результаты.")
+            state_label = ttk.Label(summary, textvariable=self.state_var, wraplength=980)
+            state_label.pack(anchor="w", pady=(4, 0))
+            add_tooltip(state_label, "Состояние текущей операции или итог последнего прохода.")
 
             table_frame = ttk.Frame(frame)
             table_frame.pack(fill="both", expand=True)
@@ -1300,8 +1371,15 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                 self.tree.bind("<Control-Button-1>", self.show_download_menu)
             scroll_y.grid(row=0, column=1, sticky="ns")
             scroll_x.grid(row=1, column=0, sticky="ew")
+            add_tooltip(scroll_y, "Прокрутить список файлов вверх или вниз.")
+            add_tooltip(scroll_x, "Прокрутить таблицу влево или вправо.")
             table_frame.rowconfigure(0, weight=1)
             table_frame.columnconfigure(0, weight=1)
+            self.selection_var = tk.StringVar(value="Файлы не выбраны")
+            selection_label = ttk.Label(table_frame, textvariable=self.selection_var)
+            selection_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
+            add_tooltip(selection_label, "Для выбора нескольких строк удерживайте Ctrl (⌘ на macOS), "
+                        "для диапазона — Shift. Esc снимает выделение.")
 
             for variable in (self.mode_var, self.sample_unit_var, self.sample_var):
                 variable.trace_add("write", self.preview_selection)
@@ -1345,7 +1423,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
 
         def selection_changed(self, _event=None) -> None:
             count = len(self.tree.selection())
-            self.selection_var.set(f"Выбрано строк: {count}" if count else "Строки не выбраны")
+            self.selection_var.set(f"Выбрано файлов: {count}" if count else "Файлы не выбраны")
             self.manual_btn.configure(state="normal" if count and not (
                 self.running or self.stopping or self.closing) else "disabled")
 
@@ -1361,6 +1439,10 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.file_menu.delete(0, "end")
             self.file_menu.add_command(label="Скачать", command=lambda: self.download(file),
                                        state="normal" if self.can_download() else "disabled")
+            self.file_menu.add_command(label="История файла", command=lambda: self.show_history(path=file.path),
+                                       state="disabled" if self.running or self.stopping or self.closing else "normal")
+            self.file_menu.add_command(label="Проверить файл", command=lambda: self.start(path=file.path),
+                                       state="disabled" if self.running or self.stopping or self.closing else "normal")
             try:
                 self.file_menu.tk_popup(event.x_root, event.y_root)
             finally:
@@ -1405,6 +1487,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             total, good, failed, unknown = self.catalog_counts
             mode = self.selected_mode()
             valid = True
+            button_text = "Проверить"
             try:
                 options = self.sample_options()
                 selected = (sample_size(good, options.get("sample_percent"), options.get("sample_count"))
@@ -1413,13 +1496,15 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                     remaining = self.full_progress.total_candidates - self.full_progress.completed_count
                     if remaining:
                         selected = remaining
+                        button_text = "Продолжить проверку"
             except ValueError:
                 selected = "— (проверьте объём выборки)"
                 valid = False
-            self.preview_var.set(f"Всего в БД: {total}    Ранее доступных: {good}    Ранее недоступных: {failed}    "
+            self.preview_var.set(f"Записей в БД: {total}    Ранее доступных: {good}    Ранее недоступных: {failed}    "
                                  f"Без достоверного результата: {unknown}    Выбрано для проверки: {selected}")
             idle = not (self.running or self.stopping or self.closing)
-            self.start_btn.configure(state="normal" if idle and self.files and valid else "disabled")
+            self.start_btn.configure(text=button_text,
+                                     state="normal" if idle and self.files and valid else "disabled")
             self.restart_btn.configure(state="normal" if idle and self.files and mode == "full" else "disabled")
             self.mode_combo.configure(state="readonly" if idle else "disabled")
             self.sample_unit_combo.configure(state="readonly" if idle and mode == "random" else "disabled")
@@ -1428,15 +1513,19 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
         def update_controls(self) -> None:
             idle = not (self.running or self.stopping or self.closing)
             self.load_btn.configure(state="normal" if idle else "disabled")
-            self.stop_btn.configure(state="normal" if (self.running or self.downloading) and not (
-                self.stopping or self.closing) else "disabled")
+            can_stop = (self.running or self.downloading) and not (self.stopping or self.closing)
+            if not can_stop:
+                self.stop_enabled_var.set(False)
+            self.stop_check.configure(state="normal" if can_stop else "disabled")
+            self.stop_btn.configure(state="normal" if can_stop and self.stop_enabled_var.get() else "disabled")
             self.export_btn.configure(state="normal" if idle and self.files else "disabled")
             self.history_btn.configure(state="normal" if idle else "disabled")
-            self.runs_btn.configure(state="normal" if idle else "disabled")
             self.token_entry.configure(state="normal" if idle else "disabled")
             self.paste_btn.configure(state="normal" if idle else "disabled")
             if self.file_menu.index("end") is not None:
                 self.file_menu.entryconfigure(0, state="normal" if self.can_download() else "disabled")
+                self.file_menu.entryconfigure(1, state="normal" if idle else "disabled")
+                self.file_menu.entryconfigure(2, state="normal" if idle else "disabled")
             self.selection_changed()
             self.preview_selection()
 
@@ -1542,22 +1631,30 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.state_var.set("Получение полного списка файлов…")
             self.launch("load", token)
 
-        def start(self, manual: bool = False, restart_full: bool = False) -> None:
+        def start(self, manual: bool = False, restart_full: bool = False, path: str | None = None) -> None:
             if self.running or self.stopping or self.closing or not self.files:
                 return
-            if manual and not self.selected_paths():
+            paths = [path] if path is not None else (self.selected_paths() if manual else None)
+            if manual and not paths:
                 return
             try:
                 with HistoryStore(history_path) as history:
-                    selection = (history.select_files(paths=self.selected_paths()) if manual else
+                    selection = (history.select_files(paths=paths) if paths is not None else
                                  history.select_files(self.selected_mode(), **self.sample_options()))
                     self.catalog_counts = history.catalog_counts()
+                    previous_full = history.full_selection() if restart_full else None
             except (ValueError, sqlite3.Error, OSError) as error:
                 messagebox.showerror("Проверка", str(error))
                 return
             files = selection.files
             token = self.get_token() if files else self.token_var.get().strip()
             if files and not token:
+                return
+            if previous_full is not None and previous_full.files and not messagebox.askyesno(
+                "Начать заново", f"Осталось проверить файлов: {len(previous_full.files)}.\n\n"
+                "Начать полную проверку всего списка заново?\nИстория проверок сохранится.",
+                default=messagebox.NO, parent=self.root,
+            ):
                 return
             self.state_var.set("Подготовка проверки…")
             self.launch("check", token, selection, restart_full)
@@ -1576,7 +1673,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             ok = sum(result.ok is True for result in self.results.values())
             fail = sum(result.ok is False for result in self.results.values())
             self.overview_var.set(
-                f"Найдено: {len(self.files)}    Доступно: {ok}    "
+                f"Файлов: {len(self.files)}    Доступно: {ok}    "
                 f"Ошибки: {fail}    Не проверено: {len(self.files) - ok - fail}"
             )
             self.preview_selection()
@@ -1676,20 +1773,23 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                 self.update_counts()
             self.root.after(75, self.consume_events)
 
-        def show_history(self, run_id: int | None = None) -> None:
+        def show_history(self, run_id: int | None = None, path: str | None = None) -> None:
+            if self.running or self.stopping or self.closing:
+                return
             try:
                 with HistoryStore(history_path) as history:
-                    entries = history.entries(self.selected_paths() if run_id is None else None, run_id=run_id)
+                    entries = history.entries([path] if path is not None else None, run_id=run_id)
             except (sqlite3.Error, OSError):
                 messagebox.showerror("История", "Не удалось прочитать историю проверок.")
                 return
             window = tk.Toplevel(self.root)
-            window.title(f"Результаты запуска #{run_id}" if run_id is not None else
-                         "История проверок — выбранные файлы или весь Диск")
+            window.title(f"Результаты прохода №{run_id}" if run_id is not None else f"История файла — {path}")
             window.geometry("1150x520")
             ttk.Label(window, text="Сетевые сбои учитываются как ошибки проверки. Время указано в местном часовом поясе.").pack(
                 anchor="w", padx=10, pady=8
             )
+            if path is not None and not entries:
+                ttk.Label(window, text="Файл ещё не проверялся").pack(anchor="w", padx=10, pady=(0, 8))
             frame = ttk.Frame(window)
             frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
             columns = ("date", "path", "status", "change", "http", "note",
@@ -1699,7 +1799,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             tree.tag_configure("bad", foreground="#B91C1C")
             for column, heading, width in zip(
                 columns, ("Дата и время", "Путь", "Результат", "Изменение", "HTTP", "Описание",
-                          "Запрошено, байт", "Получено, байт", "Время, мс", "HTTP Range", "Причина ошибки", "Запуск"),
+                          "Запрошено, байт", "Получено, байт", "Время, мс", "HTTP Range", "Причина ошибки", "Проход"),
                 (160, 340, 140, 175, 60, 300, 130, 120, 90, 100, 300, 70),
             ):
                 tree.heading(column, text=heading)
@@ -1711,43 +1811,55 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             make_sortable(tree, lambda column: {
                 iid: row[columns.index(column)] for iid, row in sort_values.items()
             })
+            add_tooltip(tree, "Каждая строка — отдельная попытка проверки. «Изменение» показывает смену результата. "
+                        "Нажмите заголовок столбца для сортировки.")
             vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
             horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
             tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
             tree.grid(row=0, column=0, sticky="nsew")
             vertical.grid(row=0, column=1, sticky="ns")
             horizontal.grid(row=1, column=0, sticky="ew")
+            add_tooltip(vertical, "Прокрутить результаты вверх или вниз.")
+            add_tooltip(horizontal, "Прокрутить таблицу влево или вправо.")
             frame.rowconfigure(0, weight=1)
             frame.columnconfigure(0, weight=1)
 
         def show_runs(self) -> None:
+            if self.running or self.stopping or self.closing:
+                return
             try:
                 with HistoryStore(history_path) as history:
                     runs = history.runs()
             except (sqlite3.Error, OSError):
-                messagebox.showerror("Запуски", "Не удалось прочитать историю запусков.")
+                messagebox.showerror("История проверок", "Не удалось прочитать историю проверок.")
                 return
             window = tk.Toplevel(self.root)
-            window.title("Запуски проверок")
+            window.title("История проверок")
             window.geometry("1150x420")
-            ttk.Label(window, text="Двойной щелчок по запуску открывает его результаты.").pack(anchor="w", padx=10, pady=8)
+            ttk.Label(window, text="Двойной щелчок по проходу открывает его результаты.\n"
+                      "Завершение прохода может оставлять файлы для повторной проверки. "
+                      "Остаток полной проверки показан в главном окне", wraplength=1100,
+                      justify="left").pack(anchor="w", padx=10, pady=8)
             frame = ttk.Frame(window, padding=(10, 0, 10, 10))
             frame.pack(fill="both", expand=True)
             columns = ("id", "started", "finished", "mode", "candidates", "selected", "checked",
                        "success", "failed", "unknown", "duration", "status")
             tree = ttk.Treeview(frame, columns=columns, show="headings")
             for column, label in zip(columns, ("№", "Начало", "Завершение", "Режим", "Кандидатов", "Выбрано",
-                    "Проверено", "Доступно", "Недоступно", "Неопределённо", "Длительность, с", "Статус")):
+                    "Проверено", "Доступно", "Недоступно", "Неопределённо", "Длительность, с", "Статус прохода")):
                 tree.heading(column, text=label)
                 tree.column(column, width=190 if column in ("started", "finished", "mode") else 110, minwidth=60)
+            tree.column("status", width=220)
             sort_values = {}
+            status_labels = {"completed": "Проход завершён", "stopped": "Остановлен",
+                             "error": "Завершён с ошибкой", None: "Выполняется"}
             for run in reversed(runs):
                 duration = run.duration
                 row = (run.id, local_time(run.started_at),
                     local_time(run.finished_at) if run.finished_at else "—", MODE_LABELS.get(run.mode, run.mode) +
                     (f" — продолжение #{run.resume_of}" if run.resume_of is not None else ""),
                     run.total_candidates, run.selected_count, run.checked_count, run.success_count,
-                    run.failed_count, run.unknown_count, f"{duration:.2f}", run.status or "выполняется")
+                    run.failed_count, run.unknown_count, f"{duration:.2f}", status_labels[run.status])
                 tree.insert("", "end", iid=str(run.id), values=row)
                 sort_values[str(run.id)] = (run.id, datetime.fromisoformat(run.started_at),
                     datetime.fromisoformat(run.finished_at) if run.finished_at else None,
@@ -1756,12 +1868,17 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                 iid: row[columns.index(column)] for iid, row in sort_values.items()
             })
             tree.bind("<Double-1>", lambda _event: self.show_history(int(tree.selection()[0])) if tree.selection() else None)
+            add_tooltip(tree, "Каждая строка — отдельный проход. Двойной щелчок открывает его результаты. "
+                        "Завершение прохода может оставлять файлы для повторной проверки. "
+                        "Нажмите заголовок столбца для сортировки.")
             vertical = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
             horizontal = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
             tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
             tree.grid(row=0, column=0, sticky="nsew")
             vertical.grid(row=0, column=1, sticky="ns")
             horizontal.grid(row=1, column=0, sticky="ew")
+            add_tooltip(vertical, "Прокрутить историю проходов вверх или вниз.")
+            add_tooltip(horizontal, "Прокрутить таблицу влево или вправо.")
             frame.rowconfigure(0, weight=1)
             frame.columnconfigure(0, weight=1)
 

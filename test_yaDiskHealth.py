@@ -2022,6 +2022,9 @@ class GuiWorkflowTests(unittest.TestCase):
                 entries = [widget for widget in controls if isinstance(widget, ttk.Entry)
                            and not isinstance(widget, ttk.Combobox)]
                 token, sample = entries
+                self.assertIs(buttons["Проверить"].master, mode.master)
+                controls_in_row = mode.master.pack_slaves()
+                self.assertIs(controls_in_row[controls_in_row.index(sample) + 1], buttons["Проверить"])
                 token.insert(0, "token")
                 tree = next(widget for widget in controls if isinstance(widget, ttk.Treeview))
                 labels = [widget for widget in controls if isinstance(widget, ttk.Label)]
@@ -2069,7 +2072,7 @@ class GuiWorkflowTests(unittest.TestCase):
                 with mod.HistoryStore(database) as history:
                     self.assertEqual([run.mode for run in history.runs()], ["failed", "random", "random", "full"])
                     self.assertEqual([run.selected_count for run in history.runs()], [2, 3, 2, 24])
-                buttons["Запуски"].invoke()
+                buttons["История проверок"].invoke()
                 runs_tree = [widget for widget in widgets(root) if isinstance(widget, ttk.Treeview)][1]
                 self.assertEqual(len(runs_tree.get_children()), 4)
                 self.assertEqual(int(runs_tree.set(runs_tree.get_children()[0], "checked")), 24)
@@ -2137,6 +2140,7 @@ class GuiWorkflowTests(unittest.TestCase):
                 nonlocal restarting
                 controls = list(widgets(root))
                 buttons = {widget.cget("text"): widget for widget in controls if isinstance(widget, ttk.Button)}
+                start = buttons["Продолжить проверку"]
                 tree = next(widget for widget in controls if isinstance(widget, ttk.Treeview))
                 labels = [widget for widget in controls if isinstance(widget, ttk.Label)]
                 token = next(widget for widget in controls if isinstance(widget, ttk.Entry))
@@ -2147,31 +2151,61 @@ class GuiWorkflowTests(unittest.TestCase):
                 self.assertIn("Осталось 2", progress.cget("text"))
                 first, second, _ = tree.get_children()
                 saved = (tree.item(first, "image"), tree.set(first, "checked"), tree.set(first, "note"))
-                buttons["Проверить"].invoke()
+                with patch("tkinter.messagebox.askyesno") as confirm:
+                    start.invoke()
+                confirm.assert_not_called()
                 try:
                     wait_until(lambda: tree.set(second, "note") == "Ожидает проверки")
                     self.assertEqual((tree.item(first, "image"), tree.set(first, "checked"), tree.set(first, "note")), saved)
                     self.assertIn("disabled", buttons["Начать заново"].state())
                 finally:
                     release.set()
-                wait_until(lambda: "disabled" not in buttons["Проверить"].state())
+                wait_until(lambda: "disabled" not in start.state())
+                self.assertEqual(start.cget("text"), "Продолжить проверку")
                 self.assertEqual(seen, [("disk:/b", 4096), ("disk:/c", 4096)])
                 self.assertIn("Завершено 2 из 3", progress.cget("text"))
                 self.assertIn("Осталось 1", progress.cget("text"))
-                buttons["Запуски"].invoke()
+                buttons["История проверок"].invoke()
                 runs_tree = [widget for widget in widgets(root) if isinstance(widget, ttk.Treeview)][1]
                 self.assertIn("продолжение #1", runs_tree.set(runs_tree.get_children()[0], "mode"))
                 mode.set("Только недоступные")
+                self.assertEqual(start.cget("text"), "Проверить")
                 self.assertIn("disabled", buttons["Начать заново"].state())
+                mode.set("Случайная проверка доступных")
+                self.assertEqual(start.cget("text"), "Проверить")
                 mode.set("Полная проверка")
+                self.assertEqual(start.cget("text"), "Продолжить проверку")
                 restarting = True
                 seen.clear()
-                buttons["Начать заново"].invoke()
-                wait_until(lambda: "disabled" not in buttons["Проверить"].state())
+                with mod.HistoryStore(database) as history:
+                    saved_runs, saved_entries = history.runs(), history.entries()
+                    saved_selection = history.full_selection()
+                with patch("tkinter.messagebox.askyesno", return_value=False) as confirm:
+                    buttons["Начать заново"].invoke()
+                confirm.assert_called_once()
+                self.assertIn("Осталось проверить файлов: 1", confirm.call_args.args[1])
+                self.assertEqual(confirm.call_args.kwargs["default"], "no")
+                self.assertEqual(seen, [])
+                self.assertEqual(start.cget("text"), "Продолжить проверку")
+                with mod.HistoryStore(database) as history:
+                    self.assertEqual(history.runs(), saved_runs)
+                    self.assertEqual(history.entries(), saved_entries)
+                    self.assertEqual(history.full_selection(), saved_selection)
+                with patch("tkinter.messagebox.askyesno", return_value=True) as confirm:
+                    buttons["Начать заново"].invoke()
+                confirm.assert_called_once()
+                wait_until(lambda: "disabled" not in start.state())
+                self.assertEqual(start.cget("text"), "Проверить")
                 self.assertEqual(seen, [(file.path, 16) for file in files])
                 self.assertIn("Завершено 3 из 3", progress.cget("text"))
                 with mod.HistoryStore(database) as history:
                     self.assertIsNone(history.runs()[-1].resume_of)
+                seen.clear()
+                with patch("tkinter.messagebox.askyesno") as confirm:
+                    buttons["Начать заново"].invoke()
+                confirm.assert_not_called()
+                wait_until(lambda: "disabled" not in start.state())
+                self.assertEqual(seen, [(file.path, 16) for file in files])
 
             root.mainloop = drive
             with patch.object(tk, "Tk", return_value=root), patch.object(mod.DiskProbe, "check_file", check), \
@@ -2273,7 +2307,7 @@ class GuiWorkflowTests(unittest.TestCase):
                                  ("name", "folder", "size", "checked", "duration"))
                 self.assertEqual(tree.heading("name", "text"), "Файл")
                 self.assertIn("disabled", buttons["Проверить"].state())
-                buttons["Загрузить список"].invoke()
+                buttons["Загрузить список файлов"].invoke()
                 self.assertIn("disabled", buttons["Проверить"].state())
                 wait_until(lambda: "disabled" not in buttons["Проверить"].state())
                 check.assert_not_called()
@@ -2292,16 +2326,25 @@ class GuiWorkflowTests(unittest.TestCase):
                 image = tree.item(tree.get_children()[0], "image")[0]
                 self.assertEqual(root.tk.call(image, "get", 8, 8), (33, 177, 90))
 
-                buttons["Снять выбор"].invoke()
+                command = tree.bind("<Escape>").split("[", 1)[1].split()[0]
+                tree.tk.call(command, "")
+                self.assertEqual(tree.selection(), ())
                 buttons["Проверить"].invoke()
                 wait_until(lambda: "disabled" not in buttons["Проверить"].state())
                 self.assertEqual(check.call_count, 3)
 
-                buttons["История"].invoke()
-                history_tree = [widget for widget in widgets(root) if isinstance(widget, ttk.Treeview)][1]
+                self.assertNotIn("История", buttons)
+                self.assertNotIn("Запуски", buttons)
+                buttons["История проверок"].invoke()
+                runs_tree = [widget for widget in widgets(root) if isinstance(widget, ttk.Treeview)][1]
+                self.assertEqual(runs_tree.winfo_toplevel().title(), "История проверок")
+                runs_tree.selection_set("2")
+                command = runs_tree.bind("<Double-1>").split("[", 1)[1].split()[0]
+                runs_tree.tk.call(command, "")
+                history_tree = [widget for widget in widgets(root) if isinstance(widget, ttk.Treeview)][2]
                 self.assertEqual(tuple(history_tree.cget("displaycolumns")),
                                  ("date", "path", "status", "change", "duration", "run"))
-                self.assertEqual(len(history_tree.get_children()), 3)
+                self.assertEqual(len(history_tree.get_children()), 2)
                 self.assertEqual(int(history_tree.set(history_tree.get_children()[0], "received")), 10)
                 self.assertEqual(int(history_tree.set(history_tree.get_children()[0], "duration")), 125)
                 for window in root.winfo_children():
@@ -2426,6 +2469,7 @@ class GuiDownloadTests(unittest.TestCase):
         controls = list(self.widgets(self.root))
         self.tree = next(widget for widget in controls if isinstance(widget, ttk.Treeview))
         self.menu = next(widget for widget in controls if isinstance(widget, tk.Menu))
+        self.stop_check = next(widget for widget in controls if isinstance(widget, ttk.Checkbutton))
         self.buttons = {widget.cget("text"): widget for widget in controls if isinstance(widget, ttk.Button)}
 
     def widgets(self, parent):
@@ -2457,6 +2501,71 @@ class GuiDownloadTests(unittest.TestCase):
         self.assertTrue(command, f"No sort command for {column}")
         tree.tk.call(command)
 
+    def show_tooltip(self, widget):
+        def popups():
+            return [child for child in widget.winfo_toplevel().winfo_children()
+                    if isinstance(child, self.tk.Toplevel) and child.overrideredirect()]
+
+        self.root.update()
+        widget.event_generate("<Enter>")
+        self.wait_until(popups)
+        return popups()[0]
+
+    def test_disabled_stop_checkbox_has_tooltip_that_hides_on_leave_and_click(self):
+        for event in ("<Leave>", "<ButtonPress-1>"):
+            popup = self.show_tooltip(self.stop_check)
+            label = next(widget for widget in popup.winfo_children() if isinstance(widget, self.ttk.Label))
+            self.assertIn("разрешить остановку", label.cget("text"))
+            self.assertIn("disabled", self.stop_check.state())
+            self.assertIn("disabled", self.buttons["Остановить"].state())
+            self.stop_check.event_generate(event)
+            self.assertFalse(popup.winfo_exists())
+
+    def test_start_tooltip_follows_full_remainder_and_selected_mode(self):
+        start = self.buttons["Проверить"]
+        popup = self.show_tooltip(start)
+        label = next(widget for widget in popup.winfo_children() if isinstance(widget, self.ttk.Label))
+        self.assertIn("Начать полную проверку", label.cget("text"))
+        start.event_generate("<Leave>")
+
+        def check(client, file):
+            client.stop.set()
+            return mod.CheckResult(True, "Данные получены", 206)
+
+        with patch.object(mod.DiskProbe, "check_file", check):
+            start.invoke()
+            self.wait_until(lambda: "disabled" not in start.state())
+        popup = self.show_tooltip(start)
+        label = next(widget for widget in popup.winfo_children() if isinstance(widget, self.ttk.Label))
+        self.assertIn("оставшиеся файлы", label.cget("text"))
+        start.event_generate("<Leave>")
+        mode = next(widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Combobox))
+        mode.set(mod.MODE_LABELS["failed"])
+        popup = self.show_tooltip(start)
+        label = next(widget for widget in popup.winfo_children() if isinstance(widget, self.ttk.Label))
+        self.assertIn("ранее сохранённой ошибкой", label.cget("text"))
+        start.event_generate("<Leave>")
+
+    def test_closing_history_cancels_pending_and_visible_tooltips(self):
+        with patch.object(self.root, "report_callback_exception") as errors:
+            self.buttons["История проверок"].invoke()
+            tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+            before = set(self.root.tk.call("after", "info"))
+            tree.event_generate("<Enter>")
+            pending = set(self.root.tk.call("after", "info")) - before
+            self.assertEqual(len(pending), 1)
+            tree.winfo_toplevel().destroy()
+            self.assertTrue(pending.isdisjoint(self.root.tk.call("after", "info")))
+            self.buttons["История проверок"].invoke()
+            tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+            tree.focus_force()
+            popup = self.show_tooltip(tree)
+            self.root.update()
+            self.assertIs(self.root.focus_get(), tree)
+            tree.winfo_toplevel().destroy()
+            self.assertFalse(popup.winfo_exists())
+        errors.assert_not_called()
+
     def reload_catalog(self, files, entries=()):
         with mod.HistoryStore(self.database) as history:
             with history.connection:
@@ -2469,12 +2578,51 @@ class GuiDownloadTests(unittest.TestCase):
                     history.connection.execute("UPDATE checks SET checked_at = ? WHERE path = ? AND checked_at = ?",
                                                (entry.checked_at, entry.path, saved.checked_at))
         with patch.object(mod.DiskProbe, "iter_files", return_value=iter(())):
-            self.buttons["Загрузить список"].invoke()
+            self.buttons["Загрузить список файлов"].invoke()
             self.wait_for_download()
 
     def table_names(self, tree=None):
         tree = tree if tree is not None else self.tree
         return tuple(tree.set(iid, "name") for iid in tree.get_children())
+
+    def test_stop_checkbox_controls_cancellation_and_resets_for_next_check(self):
+        started = threading.Event()
+        stops = []
+
+        def check(client, file):
+            stops.append(client.stop)
+            started.set()
+            client.stop.wait(3)
+            return mod.CheckResult(None, "Остановлено")
+
+        self.assertEqual(self.stop_check.cget("text"), "")
+        self.assertIs(self.stop_check.master, self.buttons["Остановить"].master)
+        self.assertIn("disabled", self.stop_check.state())
+        with patch.object(mod.DiskProbe, "check_file", check):
+            for _ in range(2):
+                started.clear()
+                self.buttons["Проверить"].invoke()
+                try:
+                    self.assertTrue(started.wait(3))
+                    self.assertNotIn("disabled", self.stop_check.state())
+                    self.assertNotIn("selected", self.stop_check.state())
+                    self.assertIn("disabled", self.buttons["Остановить"].state())
+                    self.buttons["Остановить"].invoke()
+                    self.assertFalse(stops[-1].is_set())
+                    self.stop_check.invoke()
+                    self.assertNotIn("disabled", self.buttons["Остановить"].state())
+                    self.stop_check.invoke()
+                    self.assertIn("disabled", self.buttons["Остановить"].state())
+                    self.stop_check.invoke()
+                    self.buttons["Остановить"].invoke()
+                    self.assertTrue(stops[-1].is_set())
+                finally:
+                    for stop in stops:
+                        stop.set()
+                    self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+                self.assertIn("disabled", self.stop_check.state())
+                self.assertNotIn("selected", self.stop_check.state())
+                self.assertIn("disabled", self.buttons["Остановить"].state())
 
     def test_download_during_check_keeps_check_running_and_its_status(self):
         started, release = threading.Event(), threading.Event()
@@ -2491,6 +2639,8 @@ class GuiDownloadTests(unittest.TestCase):
             self.buttons["Проверить"].invoke()
             try:
                 self.assertTrue(started.wait(3))
+                self.assertIn("disabled", self.buttons["Остановить"].state())
+                self.stop_check.invoke()
                 self.wait_until(lambda: any(widget.cget("text").startswith("Проверка файлов:") for widget in labels))
                 status = next(widget for widget in labels if widget.cget("text").startswith("Проверка файлов:"))
                 text = status.cget("text")
@@ -2507,6 +2657,119 @@ class GuiDownloadTests(unittest.TestCase):
         with mod.HistoryStore(self.database) as history:
             self.assertEqual(history.runs()[-1].checked_count, 2)
 
+    def test_file_history_uses_clicked_path_without_token_or_changing_selection(self):
+        with mod.HistoryStore(self.database) as history:
+            history.record(self.files[1].path, mod.CheckResult(True, "Данные получены", 206))
+        token = next(widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Entry))
+        token.delete(0, "end")
+        first, second = self.tree.get_children()
+        self.tree.selection_set(first)
+        with patch.object(mod, "DiskProbe") as probe, patch("tkinter.messagebox.showerror") as error:
+            self.popup(second).assert_called_once_with(55, 65)
+            self.assertEqual(self.menu.entrycget(1, "label"), "История файла")
+            self.menu.invoke(1)
+        probe.assert_not_called()
+        error.assert_not_called()
+        tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        self.assertEqual(tree.winfo_toplevel().title(), f"История файла — {self.files[1].path}")
+        self.assertEqual([tree.set(iid, "path") for iid in tree.get_children()], [self.files[1].path] * 2)
+        self.assertEqual(tree.set(tree.get_children()[0], "change"), "Доступ появился")
+        self.assertEqual(self.tree.selection(), (first,))
+
+    def test_menu_checks_clicked_file_without_changing_selection_or_full_progress(self):
+        good = mod.CheckResult(True, "Данные получены", 206, 20, 20)
+        with mod.HistoryStore(self.database) as history:
+            run_id = history.start_run("full", 2, 2, 1024, files=self.files)
+            history.record(self.files[0].path, good, run_id, run_id)
+            history.finish_run(run_id, "stopped")
+        first, second = self.tree.get_children()
+        self.tree.selection_set(first)
+        self.click_heading(self.tree, "duration")
+        self.assertEqual(self.tree.get_children(), (second, first))
+        controls = list(self.widgets(self.root))
+        mode = next(widget for widget in controls if isinstance(widget, self.ttk.Combobox))
+        sample = [widget for widget in controls if isinstance(widget, self.ttk.Entry)
+                  and not isinstance(widget, self.ttk.Combobox)][-1]
+        mode.set(mod.MODE_LABELS["random"])
+        sample.delete(0, "end")
+        sample.insert(0, "invalid")
+        with patch.object(mod.DiskProbe, "check_file", return_value=good) as check, \
+                patch.object(mod.DiskProbe, "iter_files") as listing:
+            self.popup(second).assert_called_once_with(55, 65)
+            self.assertEqual(self.menu.entrycget(2, "label"), "Проверить файл")
+            self.menu.invoke(2)
+            self.wait_until(lambda: self.menu.entrycget(2, "state") == "normal")
+        check.assert_called_once_with(self.files[1])
+        listing.assert_not_called()
+        self.assertEqual(self.tree.selection(), (first,))
+        self.assertEqual(self.tree.get_children(), (second, first))
+        self.assertEqual(self.tree.set(second, "note"), good.note)
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual(history.runs()[-1].mode, "manual")
+            self.assertEqual(history.runs()[-1].checked_count, 1)
+            self.assertEqual(history.full_selection().files, self.files[1:])
+            self.assertEqual(history.full_selection().completed_count, 1)
+
+    def test_unchecked_file_history_shows_empty_message(self):
+        first, second = self.tree.get_children()
+        self.tree.selection_set(second)
+        self.popup(first)
+        with patch.object(mod, "DiskProbe") as probe:
+            self.menu.invoke(1)
+        probe.assert_not_called()
+        tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        self.assertEqual(tree.winfo_toplevel().title(), f"История файла — {self.files[0].path}")
+        self.assertEqual(tree.get_children(), ())
+        labels = [widget.cget("text") for widget in self.widgets(tree.winfo_toplevel())
+                  if isinstance(widget, self.ttk.Label)]
+        self.assertIn("Файл ещё не проверялся", labels)
+        self.assertEqual(self.tree.selection(), (second,))
+
+    def test_history_views_are_blocked_during_check_and_restore_after_stop(self):
+        with mod.HistoryStore(self.database) as history:
+            run_id = history.start_run("manual", 1, 1)
+            history.record(self.files[0].path, self.failure, run_id)
+            history.finish_run(run_id, "completed")
+        self.buttons["История проверок"].invoke()
+        tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        tree.selection_set(str(run_id))
+        command = tree.bind("<Double-1>").split("[", 1)[1].split()[0]
+        self.popup(self.tree.get_children()[0])
+        windows = [widget for widget in self.root.winfo_children() if isinstance(widget, self.tk.Toplevel)]
+        started, release = threading.Event(), threading.Event()
+
+        def check(client, file):
+            started.set()
+            client.stop.wait(3)
+            release.wait(3)
+            return mod.CheckResult(None, "Остановлено")
+
+        with patch.object(mod.DiskProbe, "check_file", check):
+            self.buttons["Проверить"].invoke()
+            try:
+                self.assertTrue(started.wait(3))
+                for stopping in (False, True):
+                    if stopping:
+                        self.stop_check.invoke()
+                        self.buttons["Остановить"].invoke()
+                    self.assertIn("disabled", self.buttons["История проверок"].state())
+                    self.assertEqual(self.menu.entrycget(1, "state"), "disabled")
+                    self.assertEqual(self.menu.entrycget(2, "state"), "disabled")
+                    self.menu.invoke(1)
+                    self.menu.invoke(2)
+                    tree.tk.call(command, "")
+                    self.assertEqual([widget for widget in self.root.winfo_children()
+                                      if isinstance(widget, self.tk.Toplevel)], windows)
+            finally:
+                release.set()
+                self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+        self.assertNotIn("disabled", self.buttons["История проверок"].state())
+        self.assertEqual(self.menu.entrycget(1, "state"), "normal")
+        self.assertEqual(self.menu.entrycget(2, "state"), "normal")
+        tree.tk.call(command, "")
+        results = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        self.assertEqual(results.winfo_toplevel().title(), f"Результаты прохода №{run_id}")
+
     def test_check_can_start_and_finish_while_download_is_pending(self):
         started, release = threading.Event(), threading.Event()
 
@@ -2522,6 +2785,7 @@ class GuiDownloadTests(unittest.TestCase):
             self.menu.invoke(0)
             try:
                 self.assertTrue(started.wait(3))
+                self.stop_check.invoke()
                 self.assertNotIn("disabled", self.buttons["Проверить"].state())
                 self.buttons["Проверить"].invoke()
                 self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
@@ -2552,6 +2816,7 @@ class GuiDownloadTests(unittest.TestCase):
             self.buttons["Проверить"].invoke()
             try:
                 self.assertTrue(started.wait(3))
+                self.stop_check.invoke()
                 labels = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Label)]
                 self.wait_until(lambda: any(widget.cget("text").startswith("Проверка файлов:") for widget in labels))
                 status = next(widget for widget in labels if widget.cget("text").startswith("Проверка файлов:"))
@@ -2590,6 +2855,7 @@ class GuiDownloadTests(unittest.TestCase):
             self.assertTrue(started.wait(3))
             self.buttons["Проверить"].invoke()
             self.wait_until(lambda: "disabled" not in self.buttons["Проверить"].state())
+            self.stop_check.invoke()
             self.buttons["Остановить"].invoke()
             self.wait_for_download()
             browser.assert_not_called()
@@ -2616,6 +2882,7 @@ class GuiDownloadTests(unittest.TestCase):
             self.popup(self.tree.get_children()[0])
             self.menu.invoke(0)
             self.assertTrue(queued.wait(3))
+            self.stop_check.invoke()
             self.buttons["Остановить"].invoke()
             self.popup(self.tree.get_children()[1])
             self.assertEqual(self.menu.entrycget(0, "state"), "disabled")
@@ -2760,7 +3027,7 @@ class GuiDownloadTests(unittest.TestCase):
         self.click_heading(self.tree, "name")
         with patch.object(mod.DiskProbe, "iter_files", side_effect=listing), \
                 patch.object(mod, "prepare_download") as download:
-            self.buttons["Загрузить список"].invoke()
+            self.buttons["Загрузить список файлов"].invoke()
             try:
                 self.wait_until(lambda: len(self.tree.get_children()) == 2)
                 self.assertEqual(self.tree.heading("name", "text"), "Файл")
@@ -2768,6 +3035,9 @@ class GuiDownloadTests(unittest.TestCase):
                 self.assertEqual(self.table_names(), ("m", "z"))
                 self.popup(self.tree.get_children()[0])
                 self.assertEqual(self.menu.entrycget(0, "state"), "disabled")
+                self.assertEqual(self.menu.entrycget(1, "state"), "disabled")
+                self.assertEqual(self.menu.entrycget(2, "state"), "disabled")
+                self.assertIn("disabled", self.buttons["История проверок"].state())
                 self.menu.invoke(0)
                 download.assert_not_called()
                 release.set()
@@ -2787,26 +3057,24 @@ class GuiDownloadTests(unittest.TestCase):
                 run_id = history.start_run("full", 1, 1)
                 history.finish_run(run_id, "completed")
         a = mod.DiskFile("Alpha", "disk:/Alpha", 10)
-        b = mod.DiskFile("alpha", "disk:/alpha", 10)
-        c = mod.DiskFile("Бета", "disk:/Бета", 10)
-        d = mod.DiskFile("delta", "disk:/delta", 10)
-        self.reload_catalog([a, b, c, d], [
+        self.reload_catalog([a], [
             mod.HistoryEntry(a.path, "2026-10-20T15:00:00.900000+00:00", mod.CheckResult(True, "one", duration_ms=100), 1),
-            mod.HistoryEntry(b.path, "2026-10-20T15:00:00.100000+00:00", mod.CheckResult(False, "two", 403, duration_ms=20), 10),
+            mod.HistoryEntry(a.path, "2026-10-20T15:00:00.100000+00:00", mod.CheckResult(False, "two", 403, duration_ms=20), 10),
             mod.HistoryEntry(a.path, "2026-10-20T15:00:00.500000+00:00", mod.CheckResult(False, "three", 403, duration_ms=0)),
-            mod.HistoryEntry(c.path, "2026-10-20T14:59:59+00:00", mod.CheckResult(None, "Остановлено"), 2),
-            mod.HistoryEntry(d.path, "2026-10-20T14:59:58+00:00", mod.CheckResult(True, "five", duration_ms=20), 2),
+            mod.HistoryEntry(a.path, "2026-10-20T14:59:59+00:00", mod.CheckResult(None, "Остановлено"), 2),
+            mod.HistoryEntry(a.path, "2026-10-20T14:59:58+00:00", mod.CheckResult(True, "five", duration_ms=20), 2),
         ])
-        self.buttons["История"].invoke()
+        self.popup(self.tree.get_children()[0])
+        self.menu.invoke(1)
         tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
         rows = {tree.set(iid, "note"): iid for iid in tree.get_children()}
         original = {iid: tree.item(iid) for iid in tree.get_children()}
         expected = {
             "date": (("five", "Остановлено", "two", "three", "one"), ("one", "three", "two", "Остановлено", "five")),
-            "path": (("one", "three", "two", "five", "Остановлено"), ("Остановлено", "five", "one", "three", "two")),
-            "status": (("five", "one", "Остановлено", "three", "two"), ("three", "two", "Остановлено", "five", "one")),
-            "change": (("three", "two", "Остановлено", "five", "one"), ("three", "two", "Остановлено", "five", "one")),
-            "duration": (("three", "two", "five", "one", "Остановлено"), ("one", "two", "five", "three", "Остановлено")),
+            "path": (("one", "three", "two", "Остановлено", "five"), ("one", "three", "two", "Остановлено", "five")),
+            "status": (("one", "five", "Остановлено", "three", "two"), ("three", "two", "Остановлено", "one", "five")),
+            "change": (("two", "five", "three", "Остановлено", "one"), ("five", "two", "three", "Остановлено", "one")),
+            "duration": (("three", "five", "two", "one", "Остановлено"), ("one", "five", "two", "three", "Остановлено")),
             "run": (("one", "five", "Остановлено", "two", "three"), ("two", "five", "Остановлено", "one", "three")),
         }
         self.assertEqual(set(expected), set(tree.cget("displaycolumns")))
@@ -2818,7 +3086,8 @@ class GuiDownloadTests(unittest.TestCase):
                     self.assertEqual(tuple(tree.set(iid, "note") for iid in tree.get_children()), order)
                     self.assertEqual(tree.selection(), (rows["three"],))
         self.assertEqual({iid: tree.item(iid) for iid in tree.get_children()}, original)
-        self.assertEqual(tree.set(rows["three"], "change"), "Доступ не подтверждён")
+        self.assertEqual(tree.set(rows["two"], "change"), "Доступ не подтверждён")
+        self.assertEqual(tree.set(rows["five"], "change"), "Доступ появился")
 
     def test_runs_sort_all_columns_with_numeric_counts_and_missing_finish(self):
         runs = [
@@ -2834,8 +3103,15 @@ class GuiDownloadTests(unittest.TestCase):
                     (id, started_at, finished_at, mode, total_candidates, selected_count,
                      checked_count, success_count, failed_count, unknown_count, status)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", runs)
-        self.buttons["Запуски"].invoke()
+        self.buttons["История проверок"].invoke()
         tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
+        self.assertEqual(tree.heading("status", "text"), "Статус прохода")
+        self.assertEqual({iid: tree.set(iid, "status") for iid in tree.get_children()},
+                         {"1": "Проход завершён", "2": "Завершён с ошибкой", "10": "Выполняется"})
+        labels = [widget.cget("text") for widget in self.widgets(tree.winfo_toplevel())
+                  if isinstance(widget, self.ttk.Label)]
+        self.assertTrue(any("Завершение прохода может оставлять файлы для повторной проверки. "
+                            "Остаток полной проверки показан в главном окне" in text for text in labels))
         expected = {
             "id": ((1, 2, 10), (10, 2, 1)),
             "started": ((10, 2, 1), (1, 2, 10)),
@@ -2848,7 +3124,7 @@ class GuiDownloadTests(unittest.TestCase):
             "failed": ((10, 1, 2), (2, 1, 10)),
             "unknown": ((2, 1, 10), (2, 1, 10)),
             "duration": ((1, 2, 10), (10, 2, 1)),
-            "status": ((1, 2, 10), (10, 2, 1)),
+            "status": ((10, 2, 1), (1, 2, 10)),
         }
         self.assertEqual(set(expected), set(tree.cget("columns")))
         tree.selection_set("2")
@@ -2861,10 +3137,14 @@ class GuiDownloadTests(unittest.TestCase):
                     self.assertEqual(tree.heading(column, "text"), f"{heading} {arrow}")
                     self.assertEqual(tree.selection(), ("2",))
         tree.winfo_toplevel().destroy()
-        self.buttons["Запуски"].invoke()
+        with mod.HistoryStore(self.database) as history:
+            self.assertEqual([run.status for run in history.runs()], ["completed", "error", None])
+            history.finish_run(1, "stopped")
+        self.buttons["История проверок"].invoke()
         reopened = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
         self.assertEqual(reopened.heading("id", "text"), "№")
         self.assertEqual(reopened.get_children(), ("10", "2", "1"))
+        self.assertEqual(reopened.set("1", "status"), "Остановлен")
 
     def test_sorted_run_opens_its_own_results_with_sortable_headings(self):
         with mod.HistoryStore(self.database) as history:
@@ -2872,7 +3152,7 @@ class GuiDownloadTests(unittest.TestCase):
                 run_id = history.start_run("manual", 1, 1)
                 history.record(file.path, self.failure, run_id)
                 history.finish_run(run_id, "completed")
-        self.buttons["Запуски"].invoke()
+        self.buttons["История проверок"].invoke()
         tree = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
         self.click_heading(tree, "id")
         tree.selection_set(tree.get_children()[0])
@@ -2880,7 +3160,7 @@ class GuiDownloadTests(unittest.TestCase):
         tree.tk.call(command, "")
         results = [widget for widget in self.widgets(self.root) if isinstance(widget, self.ttk.Treeview)][-1]
         self.assertIsNot(results, tree)
-        self.assertEqual(results.winfo_toplevel().title(), "Результаты запуска #1")
+        self.assertEqual(results.winfo_toplevel().title(), "Результаты прохода №1")
         self.assertEqual([results.set(iid, "path") for iid in results.get_children()], [self.files[0].path])
         for column in results.cget("displaycolumns"):
             self.click_heading(results, column)
@@ -2960,7 +3240,7 @@ class GuiDownloadTests(unittest.TestCase):
         added = mod.DiskFile("new", "disk:/new", 30)
         with patch.object(mod.DiskProbe, "iter_files", return_value=iter([updated, added])), \
                 patch.object(mod.DiskProbe, "check_file") as check:
-            self.buttons["Загрузить список"].invoke()
+            self.buttons["Загрузить список файлов"].invoke()
             self.wait_for_download()
         check.assert_not_called()
         rows = {self.tree.set(iid, "name"): iid for iid in self.tree.get_children()}
@@ -3062,6 +3342,7 @@ class GuiDownloadTests(unittest.TestCase):
                 patch.object(mod.webbrowser, "open_new_tab") as browser:
             self.menu.invoke(0)
             self.assertTrue(queued.wait(3))
+            self.stop_check.invoke()
             self.buttons["Остановить"].invoke()
             self.wait_for_download()
             browser.assert_not_called()
@@ -3088,7 +3369,8 @@ class GuiDownloadTests(unittest.TestCase):
         second = self.tree.get_children()[1]
         image = self.tree.item(second, "image")[0]
         self.assertEqual(self.root.tk.call(image, "get", 8, 8), (235, 71, 71))
-        self.buttons["История"].invoke()
+        self.popup(second)
+        self.menu.invoke(1)
         history_tree = [widget for widget in self.widgets(self.root)
                         if isinstance(widget, self.ttk.Treeview)][1]
         row = history_tree.get_children()[0]
