@@ -10,7 +10,11 @@ yaDisk-Health - утилита на Python с оконным интерфейс�
 
 Успешный результат означает, что начало файла удалось получить во время проверки. Он **не подтверждает целостность всего файла**. Сетевой сбой также может дать ошибку проверки.
 
-<img width="991" height="718" alt="image" src="https://github.com/user-attachments/assets/17dde0a7-a855-4d06-bb1b-7c2c87d582fa" />
+<img width="1150" height="718" alt="image" src="https://github.com/user-attachments/assets/d60a48be-e345-4295-bb19-76b0968a4cf1" />
+
+<img width="1755" height="718" alt="image" src="https://github.com/user-attachments/assets/e1ba415b-e30a-4b78-8325-aea63a4a5b52" />
+
+<img width="1372" height="718" alt="image" src="https://github.com/user-attachments/assets/736b855b-dd04-4e51-99b4-6697ba567478" />
 
 ## Возможности
 
