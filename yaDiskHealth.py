@@ -1397,6 +1397,21 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
                         img.put(fill if dist_sq < 6.1 ** 2 else border, (x, y))
             return img
 
+        def paste_token(self, _event=None) -> str:
+            if self.token_entry.instate(("disabled",)):
+                return "break"
+            try:
+                token = self.root.clipboard_get().strip()
+            except tk.TclError:
+                token = ""
+            if not token:
+                messagebox.showwarning("Нет текста", "Скопируйте OAuth-токен в буфер обмена и повторите вставку.")
+                return "break"
+            self.token_var.set(token)
+            self.token_entry.icursor("end")
+            self.token_entry.focus_set()
+            return "break"
+
         def get_token(self) -> str:
             token = self.token_var.get().strip()
             if not token:
@@ -1506,6 +1521,7 @@ def run_gui(workers: int, history_path: str | Path = HISTORY_PATH,
             self.export_btn.configure(state="normal" if idle and self.files else "disabled")
             self.history_btn.configure(state="normal" if idle else "disabled")
             self.token_entry.configure(state="normal" if idle else "disabled")
+            self.paste_btn.configure(state="normal" if idle else "disabled")
             if self.file_menu.index("end") is not None:
                 self.file_menu.entryconfigure(0, state="normal" if self.can_download() else "disabled")
                 self.file_menu.entryconfigure(1, state="normal" if idle else "disabled")
